@@ -66,7 +66,7 @@ class NnInferenceClient(BaseInferenceClient):
             filename="state_dict.pt",
             token=token,
         )
-        weights = torch.load(weights_file, weights_only=True)
+        weights = torch.load(weights_file, weights_only=True, map_location=self.device)
         self.model.load_state_dict(weights)
 
     def process_batch(
