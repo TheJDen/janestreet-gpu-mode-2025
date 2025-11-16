@@ -334,7 +334,7 @@ class GameServer:
 
         while self.running:
             try:
-                # Get current clients
+                # Minimize lock scope: just grab a snapshot of client IDs
                 with self.client_lock:
                     client_ids = list(self.clients.keys())
 
@@ -346,6 +346,7 @@ class GameServer:
                 client_id = np.random.choice(client_ids)
 
                 # Create a batched request: one row per symbol
+                # (no locks held during this time-consuming section)
                 unique_ids = []
                 symbols = []
                 features_list = []
@@ -376,9 +377,12 @@ class GameServer:
                     symbols.append(symbol)
                     features_list.append(features)
                     targets_list.append(targets)
-                    
-                    # Track in-flight request
-                    with self.request_lock:
+
+                # Track in-flight requests all at once
+                with self.request_lock:
+                    for unique_id, symbol, features, targets in zip(
+                        unique_ids, symbols, features_list, targets_list
+                    ):
                         self.in_flight[unique_id] = InFlightRequest(
                             unique_id=unique_id,
                             symbol=symbol,
@@ -414,61 +418,75 @@ class GameServer:
                 time.sleep(0.1)
 
     def _handle_response(self, client_id: int, response: InferenceResponse):
-        """Handle an inference response from a client."""
+        """Handle an inference response from a client.
+        
+        Batch-processes all predictions in a single response together, minimizing
+        lock contention and enabling atomic scoreboard updates.
+        """
 
         response_time = time.time()
 
-        # Score each prediction
-        for unique_id, predictions in zip(response.unique_ids, response.predictions):
-            with self.request_lock:
+        # Batch-fetch all in-flight requests (minimal lock scope)
+        with self.request_lock:
+            scored_items = []
+            for unique_id, predictions in zip(response.unique_ids, response.predictions):
                 if unique_id not in self.in_flight:
                     print(f"Received response for unknown request {unique_id}")
                     continue
 
                 req = self.in_flight[unique_id]
-                req.response = response
-                req.response_time = response_time
+                # Copy only the data we need (targets, sent_time)
+                targets = req.targets
+                sent_time = req.sent_time
+                scored_items.append({
+                    "unique_id": unique_id,
+                    "predictions": predictions,
+                    "targets": targets,
+                    "sent_time": sent_time,
+                })
 
-            # Calculate latency
-            latency_ms = (response_time - req.sent_time) * 1000
+        # Compute all latencies and PNL (outside lock, no shared state accessed)
+        for item in scored_items:
+            latency_ms = (response_time - item["sent_time"]) * 1000
+            trade_pnl = self._calculate_pnl(item["predictions"], item["targets"], latency_ms)
+            accuracies = [abs(p - t) for p, t in zip(item["predictions"], item["targets"])]
 
-            # Score this request
-            trade_pnl = self._calculate_pnl(predictions, req.targets, latency_ms)
+            item["trade_pnl"] = trade_pnl
+            item["accuracies"] = accuracies
+            item["latency_ms"] = latency_ms
 
-            # Update client score
-            with self.score_lock:
-                self.client_scores[client_id]["pnl"] += trade_pnl
+        # Update client score and send scoreboard update
+        with self.score_lock:
+            for item in scored_items:
+                self.client_scores[client_id]["pnl"] += item["trade_pnl"]
                 self.client_scores[client_id]["num_responses"] += 1
 
-            # Compute accuracy per tower
-            accuracies = [abs(p - t) for p, t in zip(predictions, req.targets)]
+            num_responses = self.client_scores[client_id]["num_responses"]
 
-            # Send score update back to client
+        # Send single batched score update to scoreboard (outside of score_lock)
+        if scored_items and self.scoreboard_writer:
             score_update = ScoreUpdate(
-                unique_ids=[unique_id],
-                trade_pnls=[trade_pnl],
-                accuracies=accuracies,
-                latencies_ms=[latency_ms],
+                unique_ids=[item["unique_id"] for item in scored_items],
+                trade_pnls=[item["trade_pnl"] for item in scored_items],
+                accuracies=[acc for item in scored_items for acc in item["accuracies"]],
+                latencies_ms=[item["latency_ms"] for item in scored_items],
             )
+            try:
+                if not self.scoreboard_writer.send_message(score_update):
+                    print(f"Failed to send score update to scoreboard")
+            except Exception as e:
+                print(f"Scoreboard connection error: {e}")
+                self.scoreboard_writer = None
 
-            # Send score update to scoreboard
-            if self.scoreboard_writer:
-                try:
-                    if not self.scoreboard_writer.send_message(score_update):
-                        print(f"Failed to send score update to scoreboard")
-                except Exception as e:
-                    print(f"Scoreboard connection error: {e}")
-                    self.scoreboard_writer = None
-
-            # Print stats periodically
+        # Print stats periodically
+        if num_responses > 0 and num_responses % 100 == 0:
             with self.score_lock:
-                num_responses = self.client_scores[client_id]["num_responses"]
-                if num_responses > 0 and num_responses % 100 == 0:
-                    avg_pnl = self.client_scores[client_id]["pnl"] / num_responses
-                    print(
-                        f"Client {client_id}: {num_responses} responses, "
-                        f"avg PNL: ${avg_pnl:.2f}, total: ${self.client_scores[client_id]['pnl']:.2f}"
-                    )
+                avg_pnl = self.client_scores[client_id]["pnl"] / num_responses
+                total_pnl = self.client_scores[client_id]["pnl"]
+                print(
+                    f"Client {client_id}: {num_responses} responses, "
+                    f"avg PNL: ${avg_pnl:.2f}, total: ${total_pnl:.2f}"
+                )
 
     def _calculate_pnl(self, predictions: List[float], targets: List[float], latency_ms: float) -> float:
         """Calculate PNL for a request.

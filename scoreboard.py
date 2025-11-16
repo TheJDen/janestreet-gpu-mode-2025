@@ -42,7 +42,11 @@ class ClientStats:
     start_time: float = field(default_factory=time.time)
     last_update_time: float = field(default_factory=time.time)
     ema_pnl_per_second: float = 0.0  # Exponential moving average of PNL per second
-    ema_alpha: float = 0.3  # Smoothing factor (higher = more weight to recent data)
+    # Smoothing factor (lower = smoother / less reactive to individual spikes)
+    ema_alpha: float = 0.12
+    # Minimum delta time (seconds) to use when computing batch rate. Protects
+    # against very small time deltas that would otherwise produce enormous rates.
+    min_dt: float = 0.1
     latencies: deque = field(default_factory=lambda: deque(maxlen=100))  # Keep last 100 latencies
     all_accuracies: deque = field(default_factory=lambda: deque(maxlen=400))  # Keep last 100*4 tower predictions
     stale_threshold_seconds: float = 30.0  # Mark metrics as stale if no update for this long
@@ -71,9 +75,17 @@ class ClientStats:
         
         # Update exponential moving average of PNL per second
         if time_since_last_update > 0:
-            # Calculate the rate for this batch of requests
-            batch_pnl_per_second = sum(score_update.trade_pnls) / time_since_last_update
+            # Protect against tiny intervals which amplify the observed rate
+            dt = max(time_since_last_update, self.min_dt)
+            # Calculate the rate for this batch of requests (guarded dt)
+            batch_pnl_per_second = sum(score_update.trade_pnls) / dt
+
+            # Optionally, cap extremely large observed rates to avoid large swings
+            # relative_cap = max( abs(self.ema_pnl_per_second) * 10.0, 1e6 )
+            # batch_pnl_per_second = max(-relative_cap, min(relative_cap, batch_pnl_per_second))
+
             # EMA update: new_value = alpha * current_observation + (1 - alpha) * old_value
+            # Use a smaller alpha so that single small-dt batches don't dominate
             self.ema_pnl_per_second = (
                 self.ema_alpha * batch_pnl_per_second + 
                 (1 - self.ema_alpha) * self.ema_pnl_per_second
