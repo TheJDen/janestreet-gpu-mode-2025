@@ -68,54 +68,94 @@ All the above are just suggestions, please be creative, try things out, profile 
 
 These steps help you get a local environment running with the new batched data generation and the inverted-scoreboard architecture (scoreboard listens; server connects and pushes metrics).
 
-1. Generate reference data (batched):
+### Step 0: Generate reference data (optional, for testing)
 
-	- The data generator now runs the model in batches of `num_symbols` per step (one row per symbol per step). This is faster and preserves per-symbol state.
+The data generator now runs the model in batches of `num_symbols` per step (one row per symbol per step). This is faster and preserves per-symbol state.
 
-	```bash
-	# small quick test (fast)
-	python generate_data.py --output small_ref.parquet --num-symbols 4 --rows-per-symbol 5
+```bash
+# small quick test (fast)
+python generate_data.py --output small_ref.parquet --num-symbols 4 --rows-per-symbol 5
 
-	# full generation (example)
-	python generate_data.py --output reference.parquet --num-symbols 20 --rows-per-symbol 1000
-	```
+# full generation (example)
+python generate_data.py --output reference.parquet --num-symbols 20 --rows-per-symbol 1000
+```
 
-2. Start the scoreboard (start first so the server can connect):
+### Step 1: Start the scoreboard
 
-	```bash
-	python scoreboard.py --host localhost --port 9000
-	```
+```bash
+python scoreboard.py --host localhost --port 9000
+```
 
-	Notes: the scoreboard listens for server connections and updates the live display every second. It shows Avg PNL/Second (EMA), Avg Latency, Avg Accuracy and marks stale servers as "N/A" after a timeout.
+**Why first?** The scoreboard listens for incoming server connections. Start it before the server so the server can connect immediately.
 
-3. Start the server (second):
+**What you'll see:** Live dashboard updating every second with connected servers and their metrics:
+- Total PNL (cumulative)
+- Avg PNL/Second (exponential moving average, recent-biased)
+- Avg Latency (last 100 requests)
+- Avg Accuracy (last 400 tower predictions)
+- Stale servers marked as "N/A" after 30 seconds of silence
 
-	```bash
-	python server.py --data-file reference.parquet --host 0.0.0.0 --port 8080 --scoreboard-host localhost --scoreboard-port 9000
-	```
+### Step 2: Start the server
 
-	The server will attempt to connect to the scoreboard on startup. If the scoreboard is unavailable the server will continue running but metrics will not be recorded.
+```bash
+python server.py --data-file reference.parquet --host 0.0.0.0 --port 8080 --scoreboard-host localhost --scoreboard-port 9000
+```
 
-4. Start one or more clients (last):
+**What happens:**
+- Loads reference data from parquet
+- Attempts to connect to scoreboard at startup (non-blocking if unavailable)
+- Begins streaming batched inference requests (one row per symbol per request)
+- Scores client responses and pushes metrics to scoreboard
 
-	```bash
-	# example neural client (uses HF weights)
-	python example_model.py --host localhost --port 8080 --num-symbols 20 --token <HF_TOKEN>
+**Optional flags:**
+- `--mean-request-interval 100` (default): average milliseconds between request batches
 
-	# or the lightweight test client
-	python test_client.py --host localhost --port 8080
-	```
+### Step 3: Connect a client
 
-5. Verify the flow
+```bash
+# example model client (requires GPU)
+python example_model.py --host localhost --port 8080  --token <HF_TOKEN>
+```
 
-	- Watch the scoreboard console: it updates once per second and will display connected servers and their live metrics.
-	- If a client is slow or silent, Avg PNL/Second will decay toward 0 and latency/accuracy become `N/A` after the stale timeout.
+**What clients do:**
+- Connect to server, register, and begin receiving `InferenceRequest` messages
+- Process requests and send back `InferenceResponse` with predictions
+- Completely unaware of the scoreboard (clean separation)
 
-Tips:
- - For quick experiments use a small `--num-symbols` and `--rows-per-symbol` when generating data.
- - Use `test_client.py` to validate server side behavior without downloading model weights.
- - The server sends `InferenceRequest` messages to connected clients and pushes `ScoreUpdate` messages only to the scoreboard (clients don't need to know about the scoreboard).
+You can start **multiple clients** in parallel (each in a different terminal).
 
-Troubleshooting:
- - If the server cannot connect to the scoreboard it prints a warning and continues; start the scoreboard and restart the server to get metrics recorded.
- - If the scoreboard shows `N/A` for a server, the server hasn't sent updates recently (stale). Restart the client or check network connectivity.
+---
+
+### Quick Example (all-in-one)
+
+Terminal 1 — Scoreboard:
+```bash
+python scoreboard.py --host localhost --port 9000
+```
+
+Terminal 2 — Server:
+```bash
+python server.py --data-file reference.parquet --host 0.0.0.0 --port 8080
+```
+
+Terminal 3+ — Client(s):
+```bash
+python example_model.py --host localhost --port 8080  --token <HF_TOKEN>
+```
+
+Watch the scoreboard update in real-time as the client processes requests!
+
+---
+
+### Tips & Troubleshooting
+
+**Tips:**
+- For quick experiments use a small `--num-symbols` and `--rows-per-symbol` when generating data.
+- The server sends `InferenceRequest` messages only to inference clients and `ScoreUpdate` messages only to the scoreboard (clients don't know about the scoreboard).
+
+**Troubleshooting:**
+- **Server can't connect to scoreboard:** Server will print a warning and continue; start the scoreboard separately and restart the server if you want metrics recorded.
+- **Scoreboard shows "N/A" for server:** The server hasn't sent updates recently (stale after 30s). Restart the client or check network connectivity.
+- **No data in scoreboard display:** Ensure at least one client is connected and sending responses. The scoreboard only shows metrics from servers that have sent score updates.
+
+
