@@ -30,11 +30,11 @@ def get_default_device() -> torch.device:
     else:
         return torch.device("cpu")
 
-def recursive_clone(state):
+def recursive_copy(state, buffer):
     if isinstance(state, torch.Tensor):
-        return state.detach().clone()
+        return buffer.copy_(state, non_blocking=True)
     else:
-        return [recursive_clone(s) for s in state]
+        return [recursive_copy(s, b) for s, b in zip(state, buffer)]
 
 class NnInferenceClient(BaseInferenceClient):
     def __init__(
@@ -102,14 +102,13 @@ class NnInferenceClient(BaseInferenceClient):
             for req in symbol_requests:
                 with torch.inference_mode():
                     torch.compiler.cudagraph_mark_step_begin()
-                    pred, state = self.model(features[foffset:foffset + 1], state)
+                    pred, new_state = self.model(features[foffset:foffset + 1], state)
                     foffset += 1
                 preds[offset: offset + 1].copy_(pred)
                 offset += 1
-                state = recursive_clone(state)
+                recursive_copy(new_state, state)
                 unique_ids.append(req.unique_id)
 
-            self.states[symbol] = state 
         preds_cpu = torch.empty(preds.shape, device="cpu")
         preds_cpu.copy_(preds)
         preds = preds_cpu.tolist()

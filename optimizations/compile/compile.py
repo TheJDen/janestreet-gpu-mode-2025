@@ -32,7 +32,7 @@ def get_default_device() -> torch.device:
 
 def recursive_clone(state):
     if isinstance(state, torch.Tensor):
-        return state.detach().clone()
+        return state.clone()
     else:
         return [recursive_clone(s) for s in state]
 
