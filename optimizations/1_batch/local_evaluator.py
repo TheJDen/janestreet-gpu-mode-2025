@@ -13,17 +13,18 @@ from collections import defaultdict as ddict
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+
 from client import PendingRequest
-from example_model import NnInferenceClient
+from batch import NnInferenceClient
 
 
-class LocalProfiler:
+class LocalEvaluator:
     def __init__(self, requests_file: str):
         self.requests_df = pd.read_parquet(requests_file)
         symbol_idxs = [int(sym[-3:]) for sym in self.requests_df["symbol"].unique()]
         self.num_symbols = max(symbol_idxs) + 1
 
-    def profile_model(self, process_batch_fn, batch_size) -> dict[str, float]:
+    def evaluate_model(self, process_batch_fn, batch_size) -> dict[str, float]:
         all_requests = []
         for idx, row in self.requests_df.iterrows():
             feature_cols = [
@@ -41,8 +42,6 @@ class LocalProfiler:
         predictions = {}
         request_latencies = {}
 
-        batches_by_symbol = []
-
         for i in range(0, len(all_requests), batch_size):
             batch = all_requests[i : i + batch_size]
 
@@ -51,24 +50,18 @@ class LocalProfiler:
                 if req.symbol not in batch_by_symbol:
                     batch_by_symbol[req.symbol] = []
                 batch_by_symbol[req.symbol].append(req)
-            batches_by_symbol.append(batch_by_symbol)
-        
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(wait=4, warmup=4, active=3, repeat=0),
-            with_stack=True,
-            ) as prof:
-            for b in range(11):
-                responses = process_batch_fn(batches_by_symbol[b])
-                prof.step()
-        print("saving trace")
-        prof.export_chrome_trace("trace.json")
 
+            start_time = time.perf_counter()
+            responses = process_batch_fn(batch_by_symbol)
+            end_time = time.perf_counter()
 
-        
+            batch_time_ms = (end_time - start_time) * 1000
+
+            for unique_id, pred in zip(responses.unique_ids, responses.predictions):
+                predictions[unique_id] = pred
+                request_latencies[unique_id] = batch_time_ms
+
+        return self._calculate_metrics(predictions, request_latencies)
 
     def _calculate_metrics(self, predictions: dict, request_latencies: dict) -> dict:
         latencies = []
@@ -127,11 +120,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--token", type=str, default=None)
     args = parser.parse_args()
-    evaluator = LocalProfiler(args.requests_parquet_file)
+
+    evaluator = LocalEvaluator(args.requests_parquet_file)
     client = NnInferenceClient(num_symbols=evaluator.num_symbols, token=args.token)
 
-    metrics = evaluator.profile_model(client.process_batch, batch_size=args.batch_size)
-    
+    metrics = evaluator.evaluate_model(client.process_batch, batch_size=args.batch_size)
+    evaluator.print_report(metrics)
 
 
 if __name__ == "__main__":
