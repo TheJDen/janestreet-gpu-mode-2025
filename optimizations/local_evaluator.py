@@ -111,7 +111,7 @@ class LocalEvaluator:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("variant_dir", type=str, default="0_baseline", help="Directory containing model.py")
+    parser.add_argument("variant_dir", type=str, default="0_baseline", help="Directory containing model.py (must be in optimizations directory)")
     parser.add_argument("--requests-parquet-file", type=str, default="../small.parquet")
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--token", type=str, default=None)
@@ -122,7 +122,7 @@ def main():
 
     from inference import NnInferenceClient  # loaded from variant_dir/model.py
 
-    evaluator = LocalEvaluator(args.requests_parquet_file)
+    evaluator = LocalEvaluator(args.requests_parquet_file.rstrip('/'))
     client = NnInferenceClient(num_symbols=evaluator.num_symbols, token=args.token)
 
     metrics = evaluator.evaluate_model(client.process_batch, batch_size=args.batch_size)

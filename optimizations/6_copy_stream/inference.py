@@ -79,7 +79,7 @@ class NnInferenceClient(BaseInferenceClient):
     def interleave_by_symbol(self, requests_by_symbol):
         n = max(len(reqs) for reqs in requests_by_symbol.values())
         for i in range(n):
-            padded_features = torch.empty((self.num_symbols, self.config.num_features))
+            padded_features = torch.empty((self.num_symbols, self.config.num_features), pin_memory=True)
             uids, symbol_indices = [], []
             for symbol, reqs in requests_by_symbol.items():
                 if i >= len(reqs):
@@ -89,7 +89,7 @@ class NnInferenceClient(BaseInferenceClient):
                 symbol_index = self.symbol_to_index[symbol]
                 symbol_indices.append(symbol_index)
                 padded_features[symbol_index].copy_(torch.tensor(req.features))
-            yield uids, torch.tensor(symbol_indices), padded_features
+            yield uids, torch.tensor(symbol_indices, pin_memory=True), padded_features
 
     def update_state_at_indices(self, indices, src_state, dst_state=None):
         dst_state = dst_state if dst_state is not None else self.state
@@ -102,24 +102,29 @@ class NnInferenceClient(BaseInferenceClient):
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
     ) -> InferenceResponse:
-        unique_ids, preds = [], []
+        unique_ids = []
 
         start = time.time()
+
+        total_reqs = sum(len(v) for v in requests_by_symbol.values())
+        preds = torch.empty((total_reqs, 4), pin_memory=True)
+        offset = 0
 
         batches = self.interleave_by_symbol(requests_by_symbol)
 
         for uids, symbol_indices, batched_features in batches:
-            batched_features = batched_features.to(device=self.device)
-            symbol_indices = symbol_indices.to(device=self.device)
+            batched_features = batched_features.to(device=self.device, non_blocking=True)
+            symbol_indices = symbol_indices.to(device=self.device, non_blocking=True)
             
             with torch.inference_mode():
                 batched_preds, batched_state = self.model(batched_features, self.state)
             self.update_state_at_indices(symbol_indices, batched_state)
 
             unique_ids.extend(uids)
-            for symbol_index in symbol_indices:
-                preds.append(batched_preds[symbol_index].cpu().squeeze(0).numpy().astype(float).tolist())
-
+            preds[offset: offset + len(symbol_indices)].copy_(batched_preds.index_select(0, symbol_indices), non_blocking=True)
+            offset += len(symbol_indices)
+            
+        torch.cuda.synchronize()
         end = time.time()
         elapsed = end - start
 

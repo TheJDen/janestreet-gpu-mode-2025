@@ -33,20 +33,6 @@ def get_default_device() -> torch.device:
     else:
         return torch.device("cpu")
 
-def batch_states(states):
-    if isinstance(states[0], torch.Tensor):
-        batched = torch.cat(states, dim=0)
-        torch._dynamo.mark_dynamic(batched, 0)
-        return batched
-    return [batch_states(list(s)) for s in zip(*states)]
-
-def unbatch_state(batched_state):
-    if isinstance(batched_state, torch.Tensor):
-        B = batched_state.size(0)
-        return [batched_state[i:i+1].clone() for i in range(B)] # remember individual states had batch dim 1, clone to persist CUDA graph result
-    return list(zip(*[unbatch_state(child) for child in batched_state]))
-
-
 class NnInferenceClient(BaseInferenceClient):
     def __init__(
         self,
@@ -90,10 +76,10 @@ class NnInferenceClient(BaseInferenceClient):
             mode="reduce-overhead"
         )
 
-    def batch_interleaved_by_symbol_padded(self, requests_by_symbol):
+    def interleave_by_symbol(self, requests_by_symbol):
         n = max(len(reqs) for reqs in requests_by_symbol.values())
         for i in range(n):
-            padded_features = torch.empty((self.num_symbols, self.config.num_features))
+            padded_features = torch.empty((self.num_symbols, self.config.num_features), pin_memory=True)
             uids, symbol_indices = [], []
             for symbol, reqs in requests_by_symbol.items():
                 if i >= len(reqs):
@@ -103,44 +89,37 @@ class NnInferenceClient(BaseInferenceClient):
                 symbol_index = self.symbol_to_index[symbol]
                 symbol_indices.append(symbol_index)
                 padded_features[symbol_index].copy_(torch.tensor(req.features))
-            yield uids, symbol_indices, padded_features
+            yield uids, torch.tensor(symbol_indices, pin_memory=True), padded_features
 
-    def update_state(self, new_state, symbol_index, old_state=None):
-        old_state = old_state if old_state is not None else self.state
-        if isinstance(new_state, torch.Tensor):
-            old_state[symbol_index].copy_(new_state[symbol_index])
+    def update_state_at_indices(self, indices, src_state, dst_state=None):
+        dst_state = dst_state if dst_state is not None else self.state
+        if isinstance(src_state, torch.Tensor):
+            dst_state.index_copy_(0, indices, src_state.index_select(0, indices))
             return
-        for new_s, old_s in zip(new_state, old_state):
-            self.update_state(new_s, symbol_index, old_s)
+        for src_s, dst_s in zip(src_state, dst_state):
+            self.update_state_at_indices(indices, src_s, dst_s)
 
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
     ) -> InferenceResponse:
-        unique_ids = []
+        unique_ids, preds_gpu = [], []
 
         start = time.time()
 
-        preds = []
-        row = 0
-
-        batches = self.batch_interleaved_by_symbol_padded(requests_by_symbol)
+        batches = self.interleave_by_symbol(requests_by_symbol)
 
         for uids, symbol_indices, batched_features in batches:
-            batched_features = batched_features.to(device=self.device)
+            batched_features = batched_features.to(device=self.device, non_blocking=True)
+            symbol_indices = symbol_indices.to(device=self.device, non_blocking=True)
             
             with torch.inference_mode():
                 batched_preds, batched_state = self.model(batched_features, self.state)
+            self.update_state_at_indices(symbol_indices, batched_state)
 
             unique_ids.extend(uids)
-
-            for symbol_index in symbol_indices:
-                preds.append(batched_preds[symbol_index].clone())
-
-            for symbol_index in symbol_indices:
-                self.update_state(batched_state, symbol_index)
-        
-        
-        preds = torch.cat(preds, dim=0).cpu().tolist()
+            preds_gpu.append(batched_preds.index_select(0, symbol_indices))
+            
+        preds = torch.cat(preds_gpu, dim=0).float().cpu().tolist()    
 
         end = time.time()
         elapsed = end - start
