@@ -58,9 +58,10 @@ class NnInferenceClient(BaseInferenceClient):
         nparams = sum(p.numel() for p in self.model.parameters())
         print(f"{nparams = }")
 
-        self.symbol_to_index = {f"SYM_{i:03d}": i for i in range(self.num_symbols)}
+        self.B = self.num_symbols + 1 # add a dummy row to write to when a symbol is not included in the minibatch
 
-        self.state = self.model.init_state(self.num_symbols, self.device)
+        self.symbols_state = self.model.init_state(self.B, self.device) 
+        self.symbol_to_index = {f"SYM_{i:03d}": i + 1 for i in range(self.num_symbols)} # reserve 0 for the throwaway row
 
         weights_file = hf_hub_download(
             repo_id="jane-street-gpu-mode/hackathon",
@@ -79,25 +80,27 @@ class NnInferenceClient(BaseInferenceClient):
     def interleave_by_symbol(self, requests_by_symbol):
         n = max(len(reqs) for reqs in requests_by_symbol.values())
         for i in range(n):
-            padded_features = torch.empty((self.num_symbols, self.config.num_features))
-            uids, symbol_indices = [], []
+            symbol_indices = torch.zeros((self.B,), dtype=torch.long) # zero means we discard
+            symbols_features = torch.empty((self.B, self.config.num_features))
+            uids_by_row = [None] * self.B
             for symbol, reqs in requests_by_symbol.items():
                 if i >= len(reqs):
                     continue
                 req = reqs[i]
-                uids.append(req.unique_id)
                 symbol_index = self.symbol_to_index[symbol]
-                symbol_indices.append(symbol_index)
-                padded_features[symbol_index].copy_(torch.tensor(req.features))
-            yield uids, torch.tensor(symbol_indices), padded_features
+                uids_by_row[symbol_index] = req.unique_id
+                symbol_indices[symbol_index] = symbol_index # flag symbol to be updated
+                symbols_features[symbol_index].copy_(torch.tensor(req.features))
+            uids = [uid for uid in uids_by_row if uid is not None]
+            yield uids, symbol_indices, symbols_features
 
-    def update_state_at_indices(self, indices, src_state, dst_state=None):
-        dst_state = dst_state if dst_state is not None else self.state
+    def update_state(self, indices, src_state, dst_state=None):
+        dst_state = dst_state if dst_state is not None else self.symbols_state
         if isinstance(src_state, torch.Tensor):
-            dst_state.index_copy_(0, indices, src_state.index_select(0, indices))
+            dst_state.index_copy_(0, indices, src_state)
             return
         for src_s, dst_s in zip(src_state, dst_state):
-            self.update_state_at_indices(indices, src_s, dst_s)
+            self.update_state(indices, src_s, dst_s)
 
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
@@ -106,19 +109,19 @@ class NnInferenceClient(BaseInferenceClient):
 
         start = time.time()
 
-        batches = self.interleave_by_symbol(requests_by_symbol)
+        minibatches = self.interleave_by_symbol(requests_by_symbol)
 
-        for uids, symbol_indices, batched_features in batches:
-            batched_features = batched_features.to(device=self.device)
+        for uids, symbol_indices, req_features in minibatches:
+            req_features = req_features.to(device=self.device)
             symbol_indices = symbol_indices.to(device=self.device)
             
             with torch.inference_mode():
-                batched_preds, batched_state = self.model(batched_features, self.state)
-            self.update_state_at_indices(symbol_indices, batched_state)
+                symbols_pred, symbols_state = self.model(req_features, self.symbols_state)
+            self.update_state(symbol_indices, symbols_state)
 
             unique_ids.extend(uids)
-            for symbol_index in symbol_indices:
-                preds.append(batched_preds[symbol_index].cpu().squeeze(0).numpy().astype(float).tolist())
+            mask = symbol_indices != 0
+            preds.extend(symbols_pred[mask].cpu().numpy().astype(float).tolist())
 
         end = time.time()
         elapsed = end - start

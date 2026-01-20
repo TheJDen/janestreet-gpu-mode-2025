@@ -30,20 +30,6 @@ def get_default_device() -> torch.device:
     else:
         return torch.device("cpu")
 
-def batch_states(states):
-    if isinstance(states[0], torch.Tensor):
-        batched = torch.cat(states, dim=0)
-        return batched
-    return [batch_states(list(s)) for s in zip(*states)]
-
-def unbatch_state(batched_state):
-    if isinstance(batched_state, torch.Tensor):
-        B = batched_state.size(0)
-        return [batched_state[i:i+1] for i in range(B)] # remember individual states had batch dim 1
-    return list(zip(*[unbatch_state(child) for child in batched_state]))
-
-
-
 class NnInferenceClient(BaseInferenceClient):
     def __init__(
         self,
@@ -69,7 +55,7 @@ class NnInferenceClient(BaseInferenceClient):
         nparams = sum(p.numel() for p in self.model.parameters())
         print(f"{nparams = }")
 
-        self.states = {
+        self.symbol_states = {
             f"SYM_{num:03d}": self.model.init_state(1, self.device)
             for num in range(self.num_symbols)
         }
@@ -82,19 +68,6 @@ class NnInferenceClient(BaseInferenceClient):
         weights = torch.load(weights_file, weights_only=True)
         self.model.load_state_dict(weights)
 
-    def interleave_by_symbol(self, requests_by_symbol):
-        n = max(len(reqs) for reqs in requests_by_symbol.values())
-        for i in range(n):
-            uids, symbols, features = [], [], []
-            for symbol, reqs in requests_by_symbol.items():
-                if i >= len(reqs):
-                    continue
-                req = reqs[i]
-                symbols.append(symbol)
-                uids.append(req.unique_id)
-                features.append(req.features)
-            yield uids, symbols, torch.tensor(features)
-
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
     ) -> InferenceResponse:
@@ -102,20 +75,20 @@ class NnInferenceClient(BaseInferenceClient):
 
         start = time.time()
 
-        batches = self.interleave_by_symbol(requests_by_symbol)
+        per_symbol_requests = requests_by_symbol.items()
 
-        for uids, symbols, batched_features in batches:
-            batched_features = batched_features.to(device=self.device)
-            batched_state = batch_states([self.states[symbol] for symbol in symbols])
-            
-            with torch.inference_mode():
-                batched_preds, batched_state = self.model(batched_features, batched_state)
+        for symbol, symbol_requests in per_symbol_requests:
+            symbol_state = self.symbol_states[symbol]
+            for req in symbol_requests:
+                features = torch.tensor([req.features], device=self.device)
 
-            unique_ids.extend(uids)
-            preds.extend([pred.cpu().squeeze(0).numpy().astype(float).tolist() for pred in batched_preds])
+                with torch.inference_mode():
+                    pred, symbol_state = self.model(features, symbol_state)
 
-            for symbol, state in zip(symbols, unbatch_state(batched_state)):
-                self.states[symbol] = state
+                unique_ids.append(req.unique_id)
+                preds.append(pred.cpu().squeeze(0).numpy().astype(float).tolist())
+
+            self.symbol_states[symbol] = symbol_state
 
         end = time.time()
         elapsed = end - start

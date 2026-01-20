@@ -58,9 +58,10 @@ class NnInferenceClient(BaseInferenceClient):
         nparams = sum(p.numel() for p in self.model.parameters())
         print(f"{nparams = }")
 
-        self.symbol_to_index = {f"SYM_{i:03d}": i for i in range(self.num_symbols)}
+        self.B = self.num_symbols + 1
+        self.symbol_to_index = {f"SYM_{i:03d}": i + 1 for i in range(self.num_symbols)}
 
-        self.state = self.model.init_state(self.num_symbols, self.device)
+        self.symbols_state = self.model.init_state(self.B, self.device)
 
         weights_file = hf_hub_download(
             repo_id="jane-street-gpu-mode/hackathon",
@@ -73,58 +74,82 @@ class NnInferenceClient(BaseInferenceClient):
         self.model = torch.compile(
             self.model,
             fullgraph=True,
-            mode="reduce-overhead"
         )
+
+        # input/output buffers
+        self.symbol_indices_buffer = torch.empty((self.B,), device=self.device, dtype=torch.long)
+        self.features_buffer = torch.empty((self.B, self.config.num_features), device=self.device)
+        self.preds_buffer = torch.empty((self.B, 4), device=self.device)
+
+        self.graph = torch.cuda.CUDAGraph()
+        self._capture_done = False
 
     def interleave_by_symbol(self, requests_by_symbol):
         n = max(len(reqs) for reqs in requests_by_symbol.values())
         for i in range(n):
-            padded_features = torch.empty((self.num_symbols, self.config.num_features), pin_memory=True)
-            uids, symbol_indices = [], []
+            symbol_indices = torch.zeros((self.B,), dtype=torch.long) # zero means we discard
+            symbols_features = torch.empty((self.B, self.config.num_features))
+            uids_by_row = [None] * self.B
             for symbol, reqs in requests_by_symbol.items():
                 if i >= len(reqs):
                     continue
                 req = reqs[i]
-                uids.append(req.unique_id)
                 symbol_index = self.symbol_to_index[symbol]
-                symbol_indices.append(symbol_index)
-                padded_features[symbol_index].copy_(torch.tensor(req.features))
-            yield uids, torch.tensor(symbol_indices, pin_memory=True), padded_features
+                uids_by_row[symbol_index] = req.unique_id
+                symbol_indices[symbol_index] = symbol_index # flag symbol to be updated
+                symbols_features[symbol_index].copy_(torch.tensor(req.features))
+            uids = [uid for uid in uids_by_row if uid is not None]
+            yield uids, symbol_indices, symbols_features
 
-    def update_state_at_indices(self, indices, src_state, dst_state=None):
-        dst_state = dst_state if dst_state is not None else self.state
+    def update_state(self, src_state, dst_state=None):
+        dst_state = dst_state if dst_state is not None else self.symbols_state
         if isinstance(src_state, torch.Tensor):
-            dst_state.index_copy_(0, indices, src_state.index_select(0, indices))
+            dst_state.index_copy_(0, self.symbol_indices_buffer, src_state)
             return
         for src_s, dst_s in zip(src_state, dst_state):
-            self.update_state_at_indices(indices, src_s, dst_s)
+            self.update_state(src_s, dst_s)
+
+    @torch.inference_mode()
+    def capture(self):
+        # Warmup (populate allocator / pick kernels)
+        for _ in range(3):
+            symbols_pred, symbols_state = self.model(self.features_buffer, self.symbols_state)
+            self.preds_buffer.copy_(symbols_pred)
+            self.update_state(symbols_state)
+            
+
+        torch.cuda.synchronize()
+
+        # Capture
+        with torch.cuda.graph(self.graph):
+            symbols_pred, symbols_state = self.model(self.features_buffer, self.symbols_state)
+            self.preds_buffer.copy_(symbols_pred)
+            self.update_state(symbols_state)
+
+        self._capture_done = True
 
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
     ) -> InferenceResponse:
-        unique_ids = []
+        unique_ids, preds = [], []
 
         start = time.time()
 
-        total_reqs = sum(len(v) for v in requests_by_symbol.values())
-        preds = torch.empty((total_reqs, 4), pin_memory=True)
-        offset = 0
+        if not self._capture_done:
+            self.capture()
 
-        batches = self.interleave_by_symbol(requests_by_symbol)
+        minibatches = self.interleave_by_symbol(requests_by_symbol)
 
-        for uids, symbol_indices, batched_features in batches:
-            batched_features = batched_features.to(device=self.device, non_blocking=True)
-            symbol_indices = symbol_indices.to(device=self.device, non_blocking=True)
-            
-            with torch.inference_mode():
-                batched_preds, batched_state = self.model(batched_features, self.state)
-            self.update_state_at_indices(symbol_indices, batched_state)
+        for uids, symbol_indices, req_features in minibatches:
+            self.features_buffer.copy_(req_features)
+            self.symbol_indices_buffer.copy_(symbol_indices)
 
+            self.graph.replay()
+        
             unique_ids.extend(uids)
-            preds[offset: offset + len(symbol_indices)].copy_(batched_preds.index_select(0, symbol_indices), non_blocking=True)
-            offset += len(symbol_indices)
-            
-        torch.cuda.synchronize()
+            mask = self.symbol_indices_buffer != 0
+            preds.extend(self.preds_buffer[mask].cpu().numpy().astype(float).tolist())
+
         end = time.time()
         elapsed = end - start
 
