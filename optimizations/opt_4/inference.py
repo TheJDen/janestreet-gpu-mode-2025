@@ -22,8 +22,9 @@ from client import BaseInferenceClient, PendingRequest, InferenceResponse
 from model.inference_model import MultiTowerModel, ModelConfig
 
 # allow TF32 tensor cores at cost of precision
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
-
 
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
@@ -58,10 +59,8 @@ class NnInferenceClient(BaseInferenceClient):
         nparams = sum(p.numel() for p in self.model.parameters())
         print(f"{nparams = }")
 
-        self.B = self.num_symbols + 1 # add a dummy row to write to when a symbol is not included in the minibatch
-
-        self.symbols_state = self.model.init_state(self.B, self.device) 
-        self.symbol_to_index = {f"SYM_{i:03d}": i + 1 for i in range(self.num_symbols)} # reserve 0 for the throwaway row
+        self.B = self.num_symbols 
+        self.symbol_to_index = {f"SYM_{i:03d}": i for i in range(self.num_symbols)}
 
         weights_file = hf_hub_download(
             repo_id="jane-street-gpu-mode/hackathon",
@@ -71,17 +70,28 @@ class NnInferenceClient(BaseInferenceClient):
         weights = torch.load(weights_file, weights_only=True)
         self.model.load_state_dict(weights)
 
+        self.symbols_state = self.model.init_state(self.B, self.device)
+
         self.model = torch.compile(
             self.model,
             fullgraph=True,
+            dynamic=False,
             mode="reduce-overhead"
         )
+
+        # input/output buffers
+        self.symbols_mask_buffer = torch.empty((self.B,), device=self.device, dtype=torch.bool)
+        self.symbols_features_buffer = torch.empty((self.B, self.config.num_features), device=self.device)
+        self.symbols_pred_buffer = torch.empty((self.B, 4), device=self.device)
+
+        self.graph = torch.cuda.CUDAGraph()
+        self._capture_done = False
 
     def interleave_by_symbol(self, requests_by_symbol):
         n = max(len(reqs) for reqs in requests_by_symbol.values())
         for i in range(n):
-            symbol_indices = torch.zeros((self.B,), dtype=torch.long) # zero means we discard
             symbols_features = torch.empty((self.B, self.config.num_features))
+            symbols_mask = torch.zeros((self.B,), dtype=torch.bool)
             uids_by_row = [None] * self.B
             for symbol, reqs in requests_by_symbol.items():
                 if i >= len(reqs):
@@ -89,18 +99,38 @@ class NnInferenceClient(BaseInferenceClient):
                 req = reqs[i]
                 symbol_index = self.symbol_to_index[symbol]
                 uids_by_row[symbol_index] = req.unique_id
-                symbol_indices[symbol_index] = symbol_index # flag symbol to be updated
+                symbols_mask[symbol_index] = True
                 symbols_features[symbol_index].copy_(torch.tensor(req.features))
             uids = [uid for uid in uids_by_row if uid is not None]
-            yield uids, symbol_indices, symbols_features
+            yield uids, symbols_features, symbols_mask
 
-    def update_state(self, indices, src_state, dst_state=None):
-        dst_state = dst_state if dst_state is not None else self.symbols_state
-        if isinstance(src_state, torch.Tensor):
-            dst_state.index_copy_(0, indices, src_state)
+    def update_state(self, new_state, mask, old_state=None):
+        old_state = old_state if old_state is not None else self.symbols_state
+        if isinstance(new_state, torch.Tensor):
+            update = mask.view(self.B, *([1] * (new_state.ndim - 1)))
+            torch.where(update, new_state, old_state, out=old_state)
             return
-        for src_s, dst_s in zip(src_state, dst_state):
-            self.update_state(indices, src_s, dst_s)
+        for new_s, old_s in zip(new_state, old_state):
+            self.update_state(new_s, mask, old_s)
+
+    @torch.inference_mode()
+    def predict(self):
+        symbols_pred, symbols_state = self.model(self.symbols_features_buffer, self.symbols_state)
+        self.symbols_pred_buffer.copy_(symbols_pred) # pred is small so this is cheap
+        self.update_state(symbols_state)
+
+    def capture(self):
+        # Warmup (populate allocator / pick kernels)
+        for _ in range(3):
+            self.predict() 
+
+        torch.cuda.synchronize()
+
+        # Capture
+        with torch.cuda.graph(self.graph):
+            self.predict()
+
+        self._capture_done = True
 
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
@@ -109,19 +139,19 @@ class NnInferenceClient(BaseInferenceClient):
 
         start = time.time()
 
+        if not self._capture_done:
+            self.capture()
+
         minibatches = self.interleave_by_symbol(requests_by_symbol)
 
-        for uids, symbol_indices, req_features in minibatches:
-            req_features = req_features.to(device=self.device)
-            symbol_indices = symbol_indices.to(device=self.device)
+        for uids, symbols_features, symbols_mask in minibatches:
+            self.symbols_features_buffer.copy_(symbols_features)
+            self.symbols_mask_buffer.copy_(symbols_mask)
             
-            with torch.inference_mode():
-                symbols_pred, symbols_state = self.model(req_features, self.symbols_state)
-            self.update_state(symbol_indices, symbols_state)
+            self.graph.replay()
 
             unique_ids.extend(uids)
-            mask = symbol_indices != 0
-            preds.extend(symbols_pred[mask].cpu().numpy().astype(float).tolist())
+            preds.extend(symbols_pred[symbols_mask].cpu().numpy().astype(float).tolist())
 
         end = time.time()
         elapsed = end - start

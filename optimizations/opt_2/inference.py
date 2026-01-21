@@ -22,8 +22,9 @@ from client import BaseInferenceClient, PendingRequest, InferenceResponse
 from model.inference_model import MultiTowerModel, ModelConfig
 
 # allow TF32 tensor cores at cost of precision
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
-
 
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
@@ -46,14 +47,14 @@ class NnInferenceClient(BaseInferenceClient):
 
         self.device = device or get_default_device()
 
-        config = ModelConfig(
+        self.config = ModelConfig(
             hidden_size=2048,
             proj_size=4096,
             tower_depth=12,
             num_heads=8,
             num_features=79,
         )
-        self.model = MultiTowerModel(config).to(self.device)
+        self.model = MultiTowerModel(self.config).to(self.device)
 
         nparams = sum(p.numel() for p in self.model.parameters())
         print(f"{nparams = }")

@@ -22,8 +22,9 @@ from client import BaseInferenceClient, PendingRequest, InferenceResponse
 from model.inference_model import MultiTowerModel, ModelConfig
 
 # allow TF32 tensor cores at cost of precision
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
-
 
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
@@ -46,22 +47,20 @@ class NnInferenceClient(BaseInferenceClient):
 
         self.device = device or get_default_device()
 
-        config = ModelConfig(
+        self.config = ModelConfig(
             hidden_size=2048,
             proj_size=4096,
             tower_depth=12,
             num_heads=8,
             num_features=79,
         )
-        self.model = MultiTowerModel(config).to(self.device)
+        self.model = MultiTowerModel(self.config).to(self.device)
 
         nparams = sum(p.numel() for p in self.model.parameters())
         print(f"{nparams = }")
 
-        self.states = {
-            f"SYM_{num:03d}": self.model.init_state(1, self.device)
-            for num in range(self.num_symbols)
-        }
+        self.B = self.num_symbols 
+        self.symbol_to_index = {f"SYM_{i:03d}": i for i in range(self.num_symbols)}
 
         weights_file = hf_hub_download(
             repo_id="jane-street-gpu-mode/hackathon",
@@ -71,37 +70,39 @@ class NnInferenceClient(BaseInferenceClient):
         weights = torch.load(weights_file, weights_only=True)
         self.model.load_state_dict(weights)
 
+        self.symbols_state = self.model.init_state(self.B, self.device)
+
         self.model = torch.compile(
             self.model,
             fullgraph=True,
             mode="reduce-overhead"
         )
 
-      def batch_states(self, states):
-        if isinstance(states[0], torch.Tensor):
-            batched = torch.cat(states, dim=0)
-            torch._dynamo.mark_dynamic(batched, 0)
-            return batched
-        return [self.batch_states(list(s)) for s in zip(*states)]
-
-    def unbatch_states(self, batched_state):
-        if isinstance(batched_state, torch.Tensor):
-            B = batched_state.size(0)
-            return [batched_state[i:i+1].clone() for i in range(B)] # remember individual states had batch dim 1, clone to persist CUDA graph result
-        return list(zip(*[self.unbatch_states(child) for child in batched_state]))
-
     def interleave_by_symbol(self, requests_by_symbol):
         n = max(len(reqs) for reqs in requests_by_symbol.values())
         for i in range(n):
-            uids, symbols, features = [], [], []
+            symbols_features = torch.empty((self.B, self.config.num_features))
+            symbols_mask = torch.zeros((self.B,), dtype=torch.bool)
+            uids_by_row = [None] * self.B
             for symbol, reqs in requests_by_symbol.items():
                 if i >= len(reqs):
                     continue
                 req = reqs[i]
-                symbols.append(symbol)
-                uids.append(req.unique_id)
-                features.append(req.features)
-            yield uids, symbols, torch.tensor(features)
+                symbol_index = self.symbol_to_index[symbol]
+                uids_by_row[symbol_index] = req.unique_id
+                symbols_mask[symbol_index] = True
+                symbols_features[symbol_index].copy_(torch.tensor(req.features))
+            uids = [uid for uid in uids_by_row if uid is not None]
+            yield uids, symbols_features, symbols_mask
+
+    def update_state(self, new_state, mask, old_state=None):
+        old_state = old_state if old_state is not None else self.symbols_state
+        if isinstance(new_state, torch.Tensor):
+            update = mask.view(self.B, *([1] * (new_state.ndim - 1)))
+            torch.where(update, new_state, old_state, out=old_state)
+            return
+        for new_s, old_s in zip(new_state, old_state):
+            self.update_state(new_s, mask, old_s)
 
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
@@ -112,20 +113,17 @@ class NnInferenceClient(BaseInferenceClient):
 
         minibatches = self.interleave_by_symbol(requests_by_symbol)
 
-        for uids, symbols, reqs_features in minibatches:
-            reqs_features = reqs_features.to(device=self.device)
-            torch._dynamo.mark_dynamic(reqs_features, 0)
-            symbols_state = self.batch_states([self.symbol_states[symbol] for symbol in symbols])
+        for uids, symbols_features, symbols_mask in minibatches:
+            symbols_features = symbols_features.to(device=self.device)
+            symbols_mask = symbols_mask.to(device=self.device)
             
             with torch.inference_mode():
-                symbols_pred, symbols_state = self.model(reqs_features, symbols_state)
+                symbols_pred, symbols_state = self.model(symbols_features, self.symbols_state)
+            self.update_state(symbols_state, symbols_mask)
 
             unique_ids.extend(uids)
-            preds.extend(symbols_pred.cpu().numpy().astype(float).tolist())
+            preds.extend(symbols_pred[symbols_mask].cpu().numpy().astype(float).tolist())
 
-            for symbol, symbol_state in zip(symbols, self.unbatch_states(symbols_state)):
-                self.symbol_states[symbol] = symbol_state
-                
         end = time.time()
         elapsed = end - start
 
