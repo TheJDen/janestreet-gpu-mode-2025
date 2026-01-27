@@ -29,7 +29,6 @@ def get_default_device() -> torch.device:
         return torch.device("mps")
     else:
         return torch.device("cpu")
-
 class NnInferenceClient(BaseInferenceClient):
     def __init__(
         self,
