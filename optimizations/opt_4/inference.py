@@ -61,6 +61,7 @@ class NnInferenceClient(BaseInferenceClient):
 
         self.B = self.num_symbols 
         self.symbol_to_index = {f"SYM_{i:03d}": i for i in range(self.num_symbols)}
+        self.symbols_state = self.model.init_state(self.B, self.device)
 
         weights_file = hf_hub_download(
             repo_id="jane-street-gpu-mode/hackathon",
@@ -70,13 +71,10 @@ class NnInferenceClient(BaseInferenceClient):
         weights = torch.load(weights_file, weights_only=True)
         self.model.load_state_dict(weights)
 
-        self.symbols_state = self.model.init_state(self.B, self.device)
-
         self.model = torch.compile(
             self.model,
             fullgraph=True,
             dynamic=False,
-            mode="reduce-overhead"
         )
 
         # input/output buffers
@@ -117,7 +115,7 @@ class NnInferenceClient(BaseInferenceClient):
     def predict(self):
         symbols_pred, symbols_state = self.model(self.symbols_features_buffer, self.symbols_state)
         self.symbols_pred_buffer.copy_(symbols_pred) # pred is small so this is cheap
-        self.update_state(symbols_state)
+        self.update_state(symbols_state, self.symbols_mask_buffer)
 
     def capture(self):
         # Warmup (populate allocator / pick kernels)
@@ -151,7 +149,7 @@ class NnInferenceClient(BaseInferenceClient):
             self.graph.replay()
 
             unique_ids.extend(uids)
-            preds.extend(symbols_pred[symbols_mask].cpu().numpy().astype(float).tolist())
+            preds.extend(self.symbols_pred_buffer[symbols_mask].cpu().numpy().astype(float).tolist())
 
         end = time.time()
         elapsed = end - start

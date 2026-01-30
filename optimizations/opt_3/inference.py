@@ -61,6 +61,7 @@ class NnInferenceClient(BaseInferenceClient):
 
         self.B = self.num_symbols 
         self.symbol_to_index = {f"SYM_{i:03d}": i for i in range(self.num_symbols)}
+        self.symbols_state = self.model.init_state(self.B, self.device)
 
         weights_file = hf_hub_download(
             repo_id="jane-street-gpu-mode/hackathon",
@@ -70,11 +71,10 @@ class NnInferenceClient(BaseInferenceClient):
         weights = torch.load(weights_file, weights_only=True)
         self.model.load_state_dict(weights)
 
-        self.symbols_state = self.model.init_state(self.B, self.device)
-
         self.model = torch.compile(
             self.model,
             fullgraph=True,
+            dynamic=False,
             mode="reduce-overhead"
         )
 
