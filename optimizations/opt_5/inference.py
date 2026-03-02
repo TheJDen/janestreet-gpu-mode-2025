@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""
+Example model implementation for GPU inference game.
+Shows how to implement the BaseInferenceClient.
+"""
+
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+import numpy as np
+import time
+import argparse
+from typing import Dict, List
+import torch
+
+from huggingface_hub import hf_hub_download
+
+from client import BaseInferenceClient, PendingRequest, InferenceResponse
+from model.inference_model import MultiTowerModel, ModelConfig
+
+def get_default_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+class NnInferenceClient(BaseInferenceClient):
+    def __init__(
+        self,
+        num_symbols: int,
+        server_host: str = "localhost",
+        server_port: int = 8080,
+        device: str | None = None,
+        token: str | None = None,
+    ):
+        super().__init__(num_symbols, server_host, server_port)
+
+        self.device = device or get_default_device()
+
+        self.config = ModelConfig(
+            hidden_size=2048,
+            proj_size=4096,
+            tower_depth=12,
+            num_heads=8,
+            num_features=79,
+        )
+        self.model = MultiTowerModel(self.config).to(self.device)
+
+        nparams = sum(p.numel() for p in self.model.parameters())
+        print(f"{nparams = }")
+
+        self.B = self.num_symbols 
+        self.symbol_to_index = {f"SYM_{i:03d}": i for i in range(self.num_symbols)}
+        self.symbols_state = self.model.init_state(self.B, self.device)
+
+        weights_file = hf_hub_download(
+            repo_id="jane-street-gpu-mode/hackathon",
+            filename="state_dict.pt",
+            token=token,
+        )
+        weights = torch.load(weights_file, weights_only=True)
+        self.model.load_state_dict(weights)
+
+        # input/output buffers
+        self.symbols_mask_buffer = torch.empty((self.B,), device=self.device, dtype=torch.bool)
+        self.symbols_features_buffer = torch.empty((self.B, self.config.num_features), device=self.device)
+        self.symbols_pred_buffer = torch.empty((self.B, 4), device=self.device)
+
+        self.graph = torch.cuda.CUDAGraph()
+        self._capture_done = False
+
+    def interleave_by_symbol(self, requests_by_symbol):
+        n = max(len(reqs) for reqs in requests_by_symbol.values())
+        for i in range(n):
+            symbols_features = torch.empty((self.B, self.config.num_features))
+            symbols_mask = torch.zeros((self.B,), dtype=torch.bool)
+            uids_by_row = [None] * self.B
+            for symbol, reqs in requests_by_symbol.items():
+                if i >= len(reqs):
+                    continue
+                req = reqs[i]
+                symbol_index = self.symbol_to_index[symbol]
+                uids_by_row[symbol_index] = req.unique_id
+                symbols_mask[symbol_index] = True
+                symbols_features[symbol_index].copy_(torch.tensor(req.features))
+            uids = [uid for uid in uids_by_row if uid is not None]
+            yield uids, symbols_features, symbols_mask
+
+    def update_state(self, new_state, mask, old_state=None):
+        old_state = old_state if old_state is not None else self.symbols_state
+        if isinstance(new_state, torch.Tensor):
+            update = mask.view(self.B, *([1] * (new_state.ndim - 1)))
+            torch.where(update, new_state, old_state, out=old_state)
+            return
+        for new_s, old_s in zip(new_state, old_state):
+            self.update_state(new_s, mask, old_s)
+
+    @torch.inference_mode()
+    @torch.compile(fullgraph=True, dynamic=False)
+    def predict(self):
+        symbols_pred, symbols_state = self.model(self.symbols_features_buffer, self.symbols_state)
+        self.symbols_pred_buffer.copy_(symbols_pred) # pred is small so this is cheap
+        self.update_state(symbols_state, self.symbols_mask_buffer)
+
+    def capture(self):
+        # Warmup (populate allocator / pick kernels)
+        for _ in range(3):
+            self.predict() 
+
+        torch.cuda.synchronize()
+
+        # Capture
+        with torch.cuda.graph(self.graph):
+            self.predict()
+
+        self._capture_done = True
+
+    def process_batch(
+        self, requests_by_symbol: Dict[str, List[PendingRequest]]
+    ) -> InferenceResponse:
+        unique_ids, preds = [], []
+
+        start = time.time()
+
+        if not self._capture_done:
+            self.capture()
+
+        minibatches = self.interleave_by_symbol(requests_by_symbol)
+
+        for uids, symbols_features, symbols_mask in minibatches:
+            self.symbols_features_buffer.copy_(symbols_features)
+            self.symbols_mask_buffer.copy_(symbols_mask)
+            
+            self.graph.replay()
+
+            unique_ids.extend(uids)
+            preds.extend(self.symbols_pred_buffer[symbols_mask].cpu().numpy().astype(float).tolist())
+
+        end = time.time()
+        elapsed = end - start
+
+        # May not be a bad idea to print less often!
+        print(f"{len(preds) = }, {elapsed = }, {elapsed / len(preds) = }")
+
+        return InferenceResponse(
+            unique_ids=unique_ids, predictions=preds, client_timestamp=time.time()
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Example inference client")
+    parser.add_argument("--host", type=str, default="localhost", help="Server hostname")
+    parser.add_argument("--port", type=int, default=8080, help="Server port")
+    parser.add_argument(
+        "--num-symbols",
+        type=int,
+        default=20,
+        help="Number of symbols in the tradeable universe",
+    )
+    parser.add_argument(
+        "--token",
+        type=str,
+        default=None,
+        help="Hugging Face token to download the model (for testing before the hackathon)",
+    )
+
+    args = parser.parse_args()
+    client = NnInferenceClient(
+        num_symbols=args.num_symbols,
+        server_host=args.host,
+        server_port=args.port,
+        token=args.token,
+    )
+
+    client.run()
+
+
+if __name__ == "__main__":
+    main()
