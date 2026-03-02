@@ -122,7 +122,7 @@ class NnInferenceClient(BaseInferenceClient):
             self.update_state(symbols_state, symbols_mask)
 
             unique_ids.extend(uids)
-            preds.extend(symbols_pred[symbols_mask].cpu().numpy().astype(float).tolist())
+            preds.extend(symbols_pred[symbols_mask].float().cpu().numpy().tolist())
 
         end = time.time()
         elapsed = end - start

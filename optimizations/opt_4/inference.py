@@ -21,11 +21,6 @@ from huggingface_hub import hf_hub_download
 from client import BaseInferenceClient, PendingRequest, InferenceResponse
 from model.inference_model import MultiTowerModel, ModelConfig
 
-# allow TF32 tensor cores at cost of precision
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.set_float32_matmul_precision('high')
-
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -74,7 +69,7 @@ class NnInferenceClient(BaseInferenceClient):
         self.model = torch.compile(
             self.model,
             fullgraph=True,
-            dynamic=False,
+            dynamic=False
         )
 
         # input/output buffers

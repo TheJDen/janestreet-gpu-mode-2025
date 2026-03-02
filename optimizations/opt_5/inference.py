@@ -21,11 +21,6 @@ from huggingface_hub import hf_hub_download
 from client import BaseInferenceClient, PendingRequest, InferenceResponse
 from model.inference_model import MultiTowerModel, ModelConfig
 
-# allow TF32 tensor cores at cost of precision
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.set_float32_matmul_precision('high')
-
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -71,12 +66,6 @@ class NnInferenceClient(BaseInferenceClient):
         weights = torch.load(weights_file, weights_only=True)
         self.model.load_state_dict(weights)
 
-        self.model = torch.compile(
-            self.model,
-            fullgraph=True,
-            dynamic=False,
-        )
-
         # input/output buffers
         self.symbols_mask_buffer = torch.empty((self.B,), device=self.device, dtype=torch.bool)
         self.symbols_features_buffer = torch.empty((self.B, self.config.num_features), device=self.device)
@@ -112,6 +101,7 @@ class NnInferenceClient(BaseInferenceClient):
             self.update_state(new_s, mask, old_s)
 
     @torch.inference_mode()
+    @torch.compile(fullgraph=True, dynamic=False)
     def predict(self):
         symbols_pred, symbols_state = self.model(self.symbols_features_buffer, self.symbols_state)
         self.symbols_pred_buffer.copy_(symbols_pred) # pred is small so this is cheap
@@ -133,7 +123,7 @@ class NnInferenceClient(BaseInferenceClient):
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
     ) -> InferenceResponse:
-        unique_ids = []
+        unique_ids, preds = [], []
 
         start = time.time()
 
@@ -142,44 +132,14 @@ class NnInferenceClient(BaseInferenceClient):
 
         minibatches = self.interleave_by_symbol(requests_by_symbol)
 
-        total_reqs = sum(len(reqs) for reqs in requests_by_symbol.values())
-        preallocated_preds = torch.empty((total_reqs, 4))
-        offset = 0
-
-        num_buffers = 2
-        pinned_pred_buffers = [torch.empty((self.B, 4)) for _ in range(num_buffers)]
-        pred_masks = [None] * num_buffers
-        pred_copy_events = [torch.cuda.Event() for _ in range(num_buffers)]
-         
-        i = 0
         for uids, symbols_features, symbols_mask in minibatches:
-            self.symbols_features_buffer.copy_(symbols_features, non_blocking=True)
-            self.symbols_mask_buffer.copy_(symbols_mask, non_blocking=True)
-
+            self.symbols_features_buffer.copy_(symbols_features)
+            self.symbols_mask_buffer.copy_(symbols_mask)
+            
             self.graph.replay()
 
             unique_ids.extend(uids)
-            curr = i % num_buffers
-            pred_masks[curr] = symbols_mask
-            pinned_pred_buffers[curr].copy_(self.symbols_pred_buffer, non_blocking=True)
-            pred_copy_events[curr].record()  
-
-            if i > 0:
-                prev = (i - 1) % num_buffers
-                pred_copy_events[prev].synchronize()
-                req_preds = pinned_pred_buffers[prev][pred_masks[prev]]
-                num_preds = req_preds.shape[0]
-                preallocated_preds[offset: offset + num_preds].copy_(req_preds)
-                offset += num_preds
-            i += 1
-        # flush last
-        prev = (i - 1) % num_buffers
-        pred_copy_events[prev].synchronize()
-        req_preds = pinned_pred_buffers[prev][pred_masks[prev]]
-        num_preds = req_preds.shape[0]
-        preallocated_preds[offset: offset + num_preds].copy_(req_preds)
-        
-        preds = preallocated_preds.float().numpy().tolist()
+            preds.extend(self.symbols_pred_buffer[symbols_mask].cpu().numpy().astype(float).tolist())
 
         end = time.time()
         elapsed = end - start

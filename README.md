@@ -3,7 +3,7 @@
 
 This repository is a guided walkthrough in making a slow inference client fast. You are meant to move in order, with the goal being to build an intuition for how to identify and resolve bottlenecks by repeatedly profiling and fixing what the evidence points at. This version is focusing on changes that can be made without tinkering with model internals, and considering implementation time as a constraint as opposed to pure performance.
 
-There is a path for people who can run the code on a device with an NVIDIA H100 NVL on PCIe, and a path for people who can only read.
+There is a path for people who can run the code on a device with an NVIDIA H100, and a path for people who can only read.
 
 ---
 
@@ -31,7 +31,7 @@ The system processes a stream of requests. Each request:
 - Has ~79 numeric features  
 - Belongs to a symbol  
 - Updates and reuses symbol-specific state  
-- Produces a single prediction  
+- Produces a 4-component prediction  
 
 This shape creates classic performance traps:
 - Too many tiny kernel launches  
@@ -89,7 +89,7 @@ Example: `opt_1_trace.json`
 
 You can load the trace in `chrome://tracing`, or [Perfetto UI](https://ui.perfetto.dev) (recommended for large traces)
 
-Use the baseline trace to get a feel for how the profiler works. You should be able to point at where wall clock time is, where kernels running on the GPU stream are, how to zoom in on intervals of time, and how the stack is being represented in the CPU thread (left-to-right is wall clock time, top-to-bottom is depth of function frames in call stack). This will help you diagnose bottlenecks and better make comparisons.
+Use the baseline trace to get a feel for how the profiler works. You should be able to point at where wall clock time is, where kernels running on the GPU stream are, how to zoom in on intervals of time, and how the stack is being represented in the CPU thread (left-to-right is wall clock time, top-to-bottom is depth of function frames in call stack). This will help you diagnose bottlenecks and make better comparisons.
 
 Read each optimization in order, and follow along to the best of your ability (try making your own `optimizations` subdirectories).
 
@@ -276,14 +276,14 @@ That’s the GPU doing what it’s good at: lots of work, all at once.
 <details>
 <summary>Hint</summary>
 
-We've cut down model invocations for each batch, but each invocation is still pretty wide. If we zoom in on the trace, we see the GPU stream looks sort of like a barcode. Each little kernel has significant overhead to launch and finishes fast, leaving lots of gaps in the GPU stream where it sits idle. To take better advantage of our compute, we want our stream to be dense with wide kernels packed together tightly, rather than sparse with lots of skinny kernels and idle time in-between. If only there were a quick way to cut down on overhead and merge kernels together...
+We've cut down model invocations for each batch, but each invocation is still pretty wide. If we zoom in on the trace, we see the GPU stream looks sort of like a barcode; our GPU is finishing its jobs quickly and spending most of its time doing nothing! To take better advantage of our compute, we want our stream to be dense with wide kernels packed together tightly, rather than sparse with lots of skinny kernels and idle time in between. If only there were a quick way to cut down on overhead and merge kernels together...
 
 </details>
 
 <details>
 <summary>Explanation</summary>
 
-### Concepts: torch.compile, [Dataflow Graphs](#dataflow-graph-capture-and-graph-breaks), [CUDA Graphs](#cuda-graphs), [Arithmetic Intensity](#arithmetic-intensity), [Automated Kernel Fusion](#automated-kernel-fusion)
+### Concepts: torch.compile, [Dataflow Graphs](#dataflow-graph-capture-and-graph-breaks), [Arithmetic Intensity](#arithmetic-intensity-machine-balance-and-roofline-analysis), [Automated Kernel Fusion](#automated-kernel-fusion), [CUDA Graphs](#cuda-graphs)
 
 Let's revisit the 3 things constraining our system's throughput: GPU throughput (compute), bandwidth (communication), and overhead.
 
@@ -299,33 +299,24 @@ The system is clearly overhead-bound. Reading in the features and writing out th
 
 This loop keeps Python in the hot path, dooming us to have large idle gaps in the GPU stream. The biggest win here will be anything that helps reduce how much is going on in-between kernels.
 
-Only when we are compute-bound can we speed things up by buying a better GPU. In other words, when we are not compute-bound, in the heavy-overlap case our program could be running just as fast on a less powerful GPU, and we are essentially burning money paying for performance that is left on the table. This is because we are not utilizing our hardware well.
+When we are overhead-bound, the system upgrades that would give us the biggest speedup would be to buy a faster CPU, faster interconnect, or upgrade our driver. In other words, when we are not compute-bound, in the heavy-overlap case our program could be running just as fast on a less powerful GPU, and we are essentially burning money paying for H100 performance that is left on the table. This is because we are not utilizing our GPU hardware well.
 
 ### Dataflow Graph Capture and Graph Breaks
 
-The main benefit of `torch.compile` is lifting Python out of the hot path. When we wrap our model call with it, TorchDynamo will trace all of the tensor operations in a forward pass, freeze control flow and shapes, and generate a static graph of the tensor operations that were performed and their execution order (another DAG). This graph gets lowered into a backend internal representation (IR) (TorchInductor by default) and used to create CUDA kernels. For subsequent model invocations, the cached kernels for the entire model are launched directly, bypassing Python control flow, operation dispatch, and kernel scheduling.
+The main benefit of `torch.compile` is lifting Python overhead out of the hot path and enabling graph-level optimization. When we wrap our model call with it, TorchDynamo intercepts Python execution and traces tensor operations into a static Torch FX graph. Control flow and tensor metadata (shapes, strides, dtypes) are guarded and specialized. This FX graph is lowered into a backend internal representation (TorchInductor by default), where kernel fusion, scheduling, and memory planning occur. Inductor then generates optimized device kernels (often Triton or CUDA). For subsequent invocations with compatible inputs, the cached compiled graph is reused and the pre-generated kernels are launched directly, largely bypassing Python-level op dispatch.
 
 In the best case, `torch.compile` will be able to capture our entire model into a full graph. However, if it encounters operations it can't compile, it will fall back to eager mode to execute the offending code, and the offending code will split the full graph into parts. This is called a **graph break**. Graph breaks mostly occur when control flow is dynamic, like data-dependent Python conditionals, functions with side effects like `print`, and exception-driven logic.
 
 We can make `torch.compile` error out when there are graph breaks by using the `fullgraph=True` argument, and try to resolve any graph breaks we encounter. Luckily for our case, there were none.
 
-*How will the static graph be able to handle our dynamic batch sizes?* By default it won't, and different batch sizes will trigger graph recapture. We can mitigate this by indicating to TorchDynamo that it shouldn't specialize kernels on the batch dimension with `torch._dynamo.mark_dynamic`. For our use case where we expect to run this for several hours, there will only be so many recaptures, so this won't make a huge difference besides the one-time cost of recapture, and the overhead of storing the cached graphs, which we can afford.
+*How will the static graph be able to handle our dynamic batch sizes?* By default it won't, and different batch sizes will trigger graph recapture. We can mitigate this by indicating to TorchDynamo that it shouldn't specialize kernels on the batch dimension with `torch._dynamo.mark_dynamic`. For our use case where we expect to run this for several hours, there will only be so many recaptures, so this won't make a huge difference besides the one-time cost of recapture, and the overhead of storing the cached graphs, which we can afford. In fact, adding this when you can afford not to have it may leave specialization on the table.
 
-### CUDA Graphs
-
-One thing `torch.compile` wont do for us by default is remove kernel launches. Even with the cached dataflow graph, our CPU will still make a host API call (`cudaLaunchKernel`) to the driver for each kernel, forcing us to pay some overhead for each one. Luckily, for static graphs like this there is a CUDA driver feature we can take advantage of, **CUDA Graphs**.
-
-With a CUDA Graph, you do a capture once: the runtime/driver records the sequence of operations you enqueue on a stream (kernel launches, memcpy, memset, events, etc.) into a graph structure (yet another DAG). Then you instantiate it, which compiles/lowers that graph into an executable graph object. When you replay (`cudaGraphLaunch`), the CPU issues one launch command, and the driver enqueues a launch descriptor, the recorded batch of GPU work with dependencies already resolved, instead of re-walking and re-validating each kernel launch from scratch.
-
-This graph is different from the `torch.compile` dataflow graph and more the responsibility of the driver. To make a clear distincition, `torch.compile` is a program compiler, and CUDA Graphs are a command submission compiler.
-
-*Why doesn't `torch.compile` do this by default?* CUDA Graphs are extra picky and will replay the exact operations on the exact same memory addresses, meaning the inputs and outputs must be loaded into the same buffers. `torch.compile` will do the work of orchestrating this for you when you use the `mode="reduce-overhead"` argument, at the expense of an extra memory copy for the inputs and outputs (which are small in our case). The bigger problem is that since a CUDA Graph uses the same buffers, the inputs and outputs need to keep their exact shapes, meaning any time we call the model with differently shaped data, we have to recapture a new CUDA Graph. There is no `torch._dynamo.mark_dynamic` equivalent here, because the main way we are eliminating this overhead is by making the assumption that we are launching the same programs on the same shapes. The only reason this is viable for our current setup is that we expect to call the model repeatedly for hours, and only to encounter but a few batch sizes we can recapture and cache.
 
 ### Arithmetic Intensity, Machine Balance, and Roofline Analysis
 
 When we made our minibatches, besides amortizing the cost of overhead, we also made progress towards making our system compute-bound because we increased the throughput of our GPU. This was visible through the wider GEMM kernels.
 
-One way to tell if an algorithm will be compute-bound or communication-bound is to look at its **arithmetic intensity** (or operational intensity).
+One way to tell if an algorithm will be compute-bound or communication-bound is to look at its **arithmetic intensity** (also sometimes called operational intensity or computational intensity).
 
 Arithmetic intensity is the ratio of the total FLOPs an algorithm performs to the number of bytes it needs to communicate.
 
@@ -335,19 +326,44 @@ For specific kinds of operations on specific data types, our GPU accelerator has
 
 This is a rough visualization of what the space of possible performances our model could have might look like. For low algorithmic intensities, we will be communication-bound, and for high algorithmic intensities, we will be compute-bound. The **minimum of each forms a roofline**. We can use the roofline to gauge room for optimization (close to the roofline means close to the limits of our hardware, far from the roofline means there is room for optimization).
 
-Realistically, modern matmul implementations aggressively tile the computation and exploit reuse of the weight matrix from L2 cache, shared memory, and registers, so only a fraction of the nominal weight traffic is served by HBM, but we can still use HBM bandwidth to compute a lower bound for machine balance (or upper bound on performance). [H100 NVL](https://www.nvidia.com/en-us/data-center/h100/) has a throughput of 60 (TFLOPs/s) for fp32 without tensor cores and an HBM bandwidth of 3.9 (TB/s), so its peak intensity is about 15 (FLOPs/byte). With TF32 Tensor Cores, our H100 can achieve a throughput of 835 (TFLOPs/s), and a peak intensity of 200 (TFLOPS/s). It can be much higher with smaller data types and sparsity.
+Realistically, modern matmul implementations aggressively tile the computation and exploit reuse of the weight matrix from L2 cache, shared memory, and registers, so only a fraction of the nominal weight traffic is served by HBM, but we can still use HBM bandwidth to compute a lower bound for machine balance (or upper bound on performance). [H100 NVL](https://www.nvidia.com/en-us/data-center/h100/) has a throughput of 60 (TFLOPs/s) for fp32 without tensor cores and an HBM bandwidth of 3.9 (TB/s), so its peak intensity is about 15 (FLOPs/byte). With TF32 Tensor Cores, our H100 can achieve a throughput of 835 (TFLOPs/s), and a peak intensity of about 214 (FLOPS/byte). It can be much higher with smaller data types and sparsity.
 
-To put this in perspective, 32-bit GEMM has an arithmetic intensity of about half the batch size when the hidden dimensions of our model are large. So if we want a series of on-device full-precision matrix multiplications to saturate our H100 compute and bring us to the a compute-bound regime, we will need to have a batch size of around 30 without tensor cores, and 400 with TF32 tensor cores. Revisiting the HBM vs L2 or L1/shared memory point, the bandwidth for each is about 12 (TB/s) and 33 (TB/s), meaning being bound by L2 or L1 cache would reduce our roofline by about 3x-10x respectively.
+To put this in perspective, 32-bit GEMM has an arithmetic intensity of about half the batch size when the hidden dimensions of our model are large. So if we want a series of on-device full-precision matrix multiplications to saturate our H100 compute and bring us to the a compute-bound regime, we will need to have a batch size of around 30 without tensor cores, and 430 with TF32 tensor cores. Revisiting the HBM vs L2 or L1/shared memory point, the bandwidth for each is about 12 (TB/s) and 33 (TB/s), meaning being bound by L2 or L1 cache would reduce our roofline by about 3x-10x respectively.
 
 For the tensor core case, that's still more than the number of symbols we received in the hackathon by a lot. Luckily, there are other ways to increase the arithmetic intensity of our kernels. One way is by reducing bandwidth; if we use bf16 instead of fp32, our bandwidth would get cut in half, but we will lose precision, which may be worth it. Another way is to increase the number of FLOPs in the algorithm. For our case, because we are doing hundreds of kernels each invocation, finding operations that can be fused together into one big kernel should help; there will be fewer kernels to launch, and each one will have a higher arithmetic intensity.
 
 ### Automated Kernel Fusion
 
-This is a secondary benefit of using `torch.compile`. When TorchInductor gets our program IR, it identifies regions to fuse into single Triton kernels, or calls into CUDA/CPU librarires for large ops. This eliminates intermediate memory traffic and synchronizations and packs more ops into a single kernel, essentially giving us more arithmetic intensity for free.
+This is a secondary benefit of using `torch.compile`. When TorchInductor gets our program IR, it identifies regions to fuse into single Triton kernels, or calls into CUDA/CPU librarires like cuBLAS or cuDNN for large ops. This eliminates intermediate memory traffic and synchronizations and packs more ops into a single kernel, essentially giving us more arithmetic intensity for free.
+
+*Why not use `torch.compile` on the entire forward pass and state update?* Ideally we would. However, our recursive in-place update on dynamic batches blow up the FX graph and makes it hard for Inductor to prove safety and is susceptible to breaking on each recapture.
+
+### CUDA Graphs
+
+One thing `torch.compile` wont do for us by default is remove kernel launches. Even with the cached dataflow graph, our CPU will still make a host API call (`cudaLaunchKernel`) to the driver for each kernel, forcing us to pay some overhead for each one. Luckily, for static graphs like this there is a CUDA driver feature we can take advantage of, **CUDA Graphs**.
+
+With a CUDA Graph, you do a capture once: the runtime/driver records the sequence of operations you enqueue on a stream (kernel launches, memcpy, memset, events, etc.) into a graph structure (yet another DAG). Then you instantiate it, which compiles/lowers that graph into an executable graph object. When you replay (`cudaGraphLaunch`), the CPU issues one launch command, and the driver enqueues a launch descriptor, the recorded batch of GPU work with dependencies already resolved, instead of re-walking and re-validating each kernel launch from scratch.
+
+This graph is different from the `torch.compile` dataflow graph and more the responsibility of the driver. To make a clear distincition, `torch.compile` is a program compiler, and CUDA Graphs are a command submission compiler.
+
+*Why doesn't `torch.compile` do this by default?* CUDA Graphs are extra picky and will replay the exact operations on the exact same memory addresses, meaning the inputs and outputs must be loaded into the same buffers. `torch.compile` will do the work of orchestrating this for you when you use the `mode="reduce-overhead"` argument, at the expense of an extra memory copy for the inputs and outputs (which are small in our case).
+
+The bigger problem is that since a CUDA Graph uses the same buffers, the inputs and outputs need to keep their exact shapes, meaning any time we call the model with differently shaped data, we have to recapture a new CUDA Graph. There is no `torch._dynamo.mark_dynamic` equivalent here, because the main way we are eliminating this overhead is by making the assumption that we are launching the same programs on the same shapes. The only reason this is viable for our current setup is that we expect to call the model repeatedly for hours, and to only encounter a few batch sizes we can recapture and cache.
 
 ### Code Change
 
-A big win of `torch.compile` is its simplicity. The `fullgraph=True` argument tells `torch.compile` to raise an error if Dynamo has to create any breaks while it records from finding unsupported operations, rather than ignoring them. This can be used to ensure that the model is fully compilable without having to unknowingly give the reigns back to Python, and makes the model more compatible for fusion. The `mode="reduce-overhead"` argument tells `torch.compile` to try reducing kernel launches using CUDA Graphs.
+A big win of `torch.compile` is its simplicity. The `fullgraph=True` argument tells `torch.compile` to raise an error if Dynamo has to create any breaks while it records from finding unsupported operations, rather than ignoring them. This can be used to ensure that the model is fully compilable without having to unknowingly give the reigns back to Python, and makes the model more compatible for fusion.
+
+```python
+self.model = torch.compile(
+            self.model,
+            fullgraph=True,
+        )
+```
+
+### Code Change
+
+The `mode="reduce-overhead"` argument tells `torch.compile` to try reducing kernel launches using CUDA Graphs.
 
 ```python
 self.model = torch.compile(
@@ -357,7 +373,7 @@ self.model = torch.compile(
         )
 ```
 
-There is one caveat, though. `torch.compile` doesn't give the same promises for memory ownership that eager does. When we get the state back from the model and try to save it directly, we run the risk of it getting clobbered during the next invocation because the state is being shared somewhere under-the-hood. Python warns us about this with an error saying something like
+When we get the state back from the model and try to save it directly, we run the risk of it getting clobbered during the next invocation because the state is being shared somewhere under-the-hood. Python warns us about this with an error saying something like
 
 `RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run.`
 
@@ -371,14 +387,12 @@ The solution is to copy our outputs and state because we need to persist them.
 ```
 </details>
 
----
-
 ## Optimization 3
 
 <details>
 <summary>Hint</summary>
 
-Can we get rid of some of those annoying recaptures?
+Can we get rid of some of those annoying CUDA Graph recaptures?
 
 </details>
 
@@ -463,7 +477,7 @@ Notice how we removed our dynamo dynamic indications; we can also use the `dynam
         )
 ```
 
-We should see no more recaptures now that the shapes are static from `torch.compile` nor CUDA Graphs, and maybe even a slightly faster forward pass.
+We should see no more recaptures now that the shapes are static from `torch.compile` nor CUDA Graphs. This step was mostly to reduce the variance of our prediction times, and helps to enable new optimizations and reduce their implementation complexity.
 
 </details>
 
@@ -474,13 +488,13 @@ We should see no more recaptures now that the shapes are static from `torch.comp
 <details>
 <summary>Hint</summary>
 
-There are still quite a few kernel launches in our state udpate.
+We are communication-bound now from device-to-device copies, and there are still quite a few kernel launches in our state udpate.
 
 </details>
 <details>
 <summary>Explanation</summary>
 
-Now that our state update has static shapes, it is a prime candidate for CUDA Graphs; we are already reusing the tensors anyway. A more subtle point is that we are creating new input, prediction, and state tensors for each forward pass, and `torch.compile` is copying to and from them into persistent buffers it allocated to facilitate our use of CUDA Graphs. We can allocate these buffers ourselves and capture the graph ourselves, and eliminate both the kernel launch overhead from the state update and the now unnecessary I/O copies.
+Now that our state update has static shapes, it is a prime candidate for reducing overhead with CUDA Graphs; we are already reusing the tensors anyway. A more subtle point is that we are creating new input, prediction, and state tensors for each forward pass, and `torch.compile` is copying to and from them into persistent buffers it allocated to facilitate our use of CUDA Graphs. We can allocate these buffers ourselves and capture the graph ourselves, and eliminate both the kernel launch overhead from the state update and the now unnecessary I/O copies. Notice that this would have been much harder to implement with the dynamic batch size, and so `torch.compile` was still the right tool to reach for first.
 
 ### Code Changes
 
@@ -512,7 +526,7 @@ Then, we create a `NnInferenceClient.predict` method to be captured. Notice how 
         self.update_state(symbols_state, self.symbols_mask_buffer)
 ```
 
-Next, we define a `NnInferenceClient.capture` method. In the warmup, the kernel cache gets populated, memory gets allocated, and cuBLAS and cuDNN may do some autotuning. We don't want any of that happening in the hot loop, so we do it once and get it out of the way. The synchronization call makes sure the only kernels that get recorded by our graph are those consisting of our forward pass and state update, and nothing that may still be running from a warmup pass.
+Next, we define a `NnInferenceClient.capture` method. In the warmup, the kernel cache gets populated, memory gets allocated, and cuBLAS and cuDNN may do some autotuning. We don't want any of that happening in the hot loop, so we warmup once to get it out of the way. The synchronization call makes sure the only kernels that get recorded by our graph are those consisting of our forward pass and state update, and nothing that may still be running from a warmup pass.
 
 ```python
     def capture(self):
@@ -529,7 +543,7 @@ Next, we define a `NnInferenceClient.capture` method. In the warmup, the kernel 
         self._capture_done = True
 ```
 
-Now when we process our first minibatch we capture, and otherwise we replay our graph. We make sure to copy to and from the appropriate buffers using `.copy_()` to do them in-place.
+Now when we process our first minibatch we capture, and otherwise we replay our graph. Each iteration, we update the preallocated input buffers in-place via `.copy_()`, so that the graph sees the new data in the same tensor storage.
 
 ```python
         if not self._capture_done:
@@ -555,20 +569,100 @@ Now when we process our first minibatch we capture, and otherwise we replay our 
 <details>
 <summary>Hint</summary>
 
-Why is the GPU idling inbetween minibatches?
+We are still communication-bound because our forward pass and state update do multiple copies of the state tensor. If only we could easily fuse some of those kernels now that our entire forward pass and update have static shapes, preallocated inputs and outputs, and only need to get compiled once.
+
+</details>
+<details>
+<summary>Explanation</summary>
+
+Previously, dynamic shapes and mutation patterns made it difficult for TorchDynamo to trace a single, safe FX graph and for Inductor to reason about aliasing across iterations. With stable shapes and a fixed execution path, neither `torch.compile` nor the CUDA Graph runtime need to regenerate artifacts, which prevents recapture failures and avoids accumulating multiple compiled graph instances in memory.
+
+### Code Changes
+
+We just get rid of the `torch.compile` around the model in `NnInferenceClient.__init__` and add it to `NnInferenceClient.predict` instead.
+
+```python
+    @torch.inference_mode()
+    @torch.compile(fullgraph=True, dynamic=False)
+    def predict(self):
+        symbols_pred, symbols_state = self.model(self.symbols_features_buffer, self.symbols_state)
+        self.symbols_pred_buffer.copy_(symbols_pred) # pred is small so this is cheap
+        self.update_state(symbols_state, self.symbols_mask_buffer)
+```
+
+Note: `torch.compile` turns the device-to-device copies from `torch.where` into predicated multiply-add selects. Pretty cool optimization that would have took me a while to think of.
+
+</details>
+
+## Optimization 6
+
+<details>
+<summary>Hint</summary>
+
+It is hard to say without inspecting the kernels more rigorously with Nsight Compute or viewing their source, but our aggressive compilation and batching has at least pushed us away from being dominated by device-to-device copies, if not fully into a compute-bound regime! I will give you a tip we didn't get during the hackathon, which is that we can tolerate about 1e-3 absolute error before our score starts going down.
+
+</details>
+<details>
+<summary>Explanation</summary>
+
+Recall from [Arithmetic Intensity](#arithmetic-intensity-machine-balance-and-roofline-analysis) that we have a couple of levers we can pull now that we have wide dense kernels and are compute-bound or partially memory bound.
+
+## Tensor Cores
+Tensor Cores are dedicated hardware units for accelerating matrix multiplication. They can dramatically raise the compute roof for supported GEMMs up to 10x-20x in comparison to the default CUDA Cores. We can encourage PyTorch to lower into kernels that dispatch Tensor Core instructions by setting the appropriate CUDA and cuDNN flags, and using Tensor Core-friendly dtypes like bf16/fp16/tf32/fp8.
+
+## bfloat16
+bfloat16 (bf16) is a 16-bit floating type that keeps the same exponent range as fp32, but uses fewer mantissa bits. It’s much less likely to overflow than fp16, but it’s still lower precision than fp32. bf16 is attractive for inference on H100 because
+ - bf16 GEMMs are designed to hit Tensor Cores efficiently.
+ - bf16 lowers bandwidth pressure by halving the bytes moved versus fp32, which helps if we are even partly memory-bound.
+ - bf16 is usually numerically stable because the exponent range matches fp32
+
+To improve our runtime, our main levers without writing kernels will be making more effective use of Hopper Tensor Cores, and running our model in bf16 to reduce bandwidth and increase arithmetic intensity (nudging compute-bound kernels to that higher compute-roofline).
+
+### Code Changes
+
+At the top of the file, we set torch tf32 flags to encourage Tensor Core lowering. We also set the default dtype to bf16 so that the state and input tensors get initialized in bf16.
+
+```python
+torch.set_default_dtype(torch.bfloat16)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('medium')
+```
+
+Then we also cast our model weights to bf16 in `NnInferenceClient.__init__`.
+
+```python
+        self.model.load_state_dict(weights)
+        self.model.to(dtype=torch.bfloat16)
+```
+
+And make sure to cast our preds back to float
+```python
+        preds.extend(self.symbols_pred_buffer[symbols_mask].float().cpu().numpy().tolist())
+```
+
+</details>
+
+
+## Optimization 7
+
+<details>
+<summary>Hint</summary>
+
+Why is the GPU idling in between minibatches?
 
 </details>
 
 <details>
 <summary>Explanation</summary>
 
-### Concepts: [Implicit Synchronization](#implicit-synchronization), [DMA Engines, Page-locked Memory, and Pinned Memory](#page-locked-and-pinned-memory)
+### Concepts: [Implicit Synchronization](#implicit-synchronization), [CUDA Events](#cuda-events), [Pipelining](#pipelining), [DMA Engines](#dma-engines), [Paged Memory and Pinned Memory](#paged-memory-and-pinned-memory)
 
 ### Implicit Synchronization
 
-Now that we have CUDA Graphs wrapping our logic for each minibatch, the next obvious sources of overhead are the gaps between minibatches.
+Now that we have CUDA Graphs wrapping our logic for each minibatch, the last remaining sources of overhead are the gaps between minibatches.
 
-Since our model is running on our H100, when we call `.to` or `self.graph.replay()` in PyTorch, the main thread is simply enqueueing work to be done by the GPU. We have all of the data for our minibatches from the start of `NnInferenceClient.process_batch`, so we could enqueue all of them straightaway. Those gaps have to be from the CPU side getting forced to wait because we accidentally created a dependency between:
+Since our model is actually running on our H100, when we call `.to` or `self.graph.replay()` in PyTorch, the main thread is simply enqueueing work to be done by the GPU asynchronously. We have all of the data for our minibatches from the start of `NnInferenceClient.process_batch`, so we should be able to enqueue all of the feature copies, model invocations, and prediction copies straight away and simply wait for the GPU to finish. Even though all of the operations are serialized in the same GPU stream, the copies we do to and from the device are tiny. Those large gaps have to be from the CPU side getting forced to wait because we accidentally created a dependency between:
 
  - **H2D (host → device)** copies: CPU RAM → GPU HBM
 
@@ -596,19 +690,21 @@ In our case, the syncs are occuring at these lines
             preds.extend(self.symbols_pred_buffer[symbols_mask].cpu().numpy().astype(float).tolist())
 ```
 
-The biggest offenders are the `.cpu()` and `.tolist()` , because they force the main thread to stall and serialize the outputs before creating the next minibatch and enqueueing the next iteration.
-
-There is a `non_blocking=True` argument that `.to()` and `.copy_()` accept which allows PyTorch to enqueue the copies and move on before completion. It is not enabled by default because it can lead to spooky behavior if you introduce race conditions.
+There is a `non_blocking=True` argument that `.to()` and `.copy_()` accept which allows PyTorch to enqueue the copies and move on before completion without doing a stream sync. It is not enabled by default because it can lead to spooky behavior if you introduce race conditions.
 
 ```python
 x = torch.tensor(...)
 y = torch.tensor(...)
-
+...
 y.copy_(x, non_blocking=True)
 del x   # oops
 ```
 
-Logic like this can lead to `y` having malformed data. In our case, we have streamlined our operations and are doing are in the clear. PyTorch will synchronize kernels that depend on enqueued copies. Further, we don't need to materialize the preds in the main loop, and we can hoist them out of the main loop.
+Logic like this can lead to `y` having malformed data. In our case, we have streamlined our operations and are in the clear. Because we are enqueueing the copies on the same stream as the compute, we don't have to synchronize manually; the forward pass will only be able to start after the copy that was enqueued on the same stream finished anyway.
+
+*What about the predictions?*
+
+This one is more subtle. The biggest offenders appear to be the `.cpu()` and `.tolist()`, because they force the main thread to stall and materialize the outputs before creating the next minibatch and enqueueing the next iteration. We don't need to materialize the preds in the main loop, and so we might think to hoist them out of the main loop.
 
 ```python
     masks = []
@@ -627,83 +723,60 @@ Logic like this can lead to `y` having malformed data. In our case, we have stre
     preds = torch.cat(preds)[[torch.cat(masks)].float().numpy().tolist()]
 ```
 
-Sadly, this still keeps our syncs at each `.copy_` call. What gives?
+However, this pushes all of the latency to the end of the loop. Now, instead of there being gaps between each minibatch, there is just a large idle period after all of the minibatches. Since the predictions are processed on CPU, ideally we want to hide this latency by overlapping it with the CUDA Graph replay on GPU.
 
-### DMA Engines, Page-locked Memory, and Pinned Memory
+## CUDA Events
 
-When you call `copy_` from CPU → GPU (H2D) or GPU → CPU (D2H), you’re asking for a DMA transfer.
+We want the CPU to start processing predictions as soon as a minibatch is ready, without stalling the whole loop.
 
-**DMA (direct memory access)** means “move bytes without involving the GPU’s SMs (compute cores).” Modern GPUs have dedicated **copy engines (DMA engines)** that can move data while the SMs are busy doing math. That’s the overlap we want: compute stream stays dense while copy engines quietly shuttle bytes on the side.
+The problem is that “GPU work is async” is both a blessing and a curse: The CPU can enqueue a ton of work quickly, but it also has no idea when a specific minibatch finishes unless we force a sync. This is where CUDA Events come in.
 
-But there’s a catch: DMA can’t safely pull from normal pageable CPU memory asynchronously.
+**A CUDA Event is basically a timestamped marker you can drop into a CUDA stream**
 
-Most CPU memory is **pageable: the OS is allowed to move it around (swap, compact, remap)**. If the GPU’s DMA engine starts reading from a CPU pointer and the OS relocates that page mid-transfer, you get incorrect tensor values. **Pinned memory (or page-locked memory)** is CPU RAM that the OS promises not to page out or remap. It is expensive because there is only room for a few GB of it at a time and it slows down allocations everywhere else, but because the address is stable, the GPU can DMA directly from/to it asynchronously.
+When the stream reaches the event, the GPU “records” it. On the CPU, you can later ask: “has this event happened yet?” Or you can block only when needed by waiting on that event. This lets you avoid the nuclear option `torch.cuda.synchronize()`, which waits for *everything*.
 
-If the source (or destination) CPU memory is pageable, the driver typically has to stage the copy:
+## Pipelining
 
- - Allocate an internal pinned (page-locked) staging buffer.
+To achieve the overlap we want, we have to build a pipeline. **Pipelining is a loop optimization method that works by breaking the body into stages that can be done *at the same time***. In our case, we can define 2 stages for each batch: one stage copies the inputs to the GPU, replays the CUDA Graph, copies the predictions to the host device, and records a CUDA Event; the other stage blocks on the CUDA Event and materializes the predictions in our output list. The CPU thread and GPU stream enable the stages to run in parallel, but only if we overlap the first stage of a given batch with the second stage of its previous batch. This means there will be one iteration where we fill the pipeline, **the prologue**, and one iteration where we drain the pipeline, **the epilogue**. (If there were k stages, the prologue and epilogue would have length k - 1). The remaining batches will occupy a steady-state where their stages are computed in parallel.
 
- - CPU copies your pageable memory into that staging buffer (synchronous from the CPU’s perspective).
+<img src="images/pipeline.png" alt="Pipelined Loop Comparison" style="width:800px;"/>
 
- - DMA engine copies from pinned buffer ↔ GPU.
+## DMA Engines
 
-That staging step is exactly why you can still see syncs even with `non_blocking=True`: PyTorch can enqueue the GPU-side DMA, but it still has to do the staging copy first if your host tensor isn’t pinned.
+To write memory to and from the host quickly, the GPU uses a DMA Engine. **A DMA (Direct Memory Access) Engine** is a hardware component that transfers data between system memory and GPU HBM without the CPU having to intervene. DMA Engines allow a GPU to perform H2D or D2H copies in a parallel stream; if our copies to and from the device weren't so tiny compared to our model invocation, we would do this. But they are, so we won't. The DMA Engine is what enables the asynchronous copy I mentioned earlier. The CPU can enqueue the operation and move on because the GPU has dedicated hardware that lets it move bytes to and from host memory directly.
 
-In PyTorch, a CPU tensor is pinned if it’s allocated with the `pin_memory=True` argument. So the rule of thumb is: `non_blocking=True` only delivers real overlap if the host tensor involved in the transfer is pinned (and the device supports async copy, which our H100 absolutely does).
+## Paged Memory and Pinned Memory
 
-Why your code still syncs
+Virtual memory complicates this. When you allocate a tensor in PyTorch, by default it is allocated in paged memory. **Paged memory can be paged out to disk, remapped, or relocated by the OS at any time**. If the OS does any of these mid-transfer, the GPU moves bytes from a stale address. To prevent this, the driver only programs the DMA Engine to operate on pinned memory. **Pinned memory, or page-locked memory, is memory in which the OS has guaranteed the physical pages wont move**. Pinned memory is expensive to allocate and store, hence why it is not the default. If we schedule a D2H or H2D copy on a tensor allocated with pageable memory, to gurantee the data doesn't become stale, the OS has to allocate a pinned tensor before it can proceed—even if the copy was marked `non_blocking=True`. This allocation acts as a synchronization; so in other words, if we want a truly asynchronous copy, we need to preallocate a pinned buffer to copy into. This pinned allocation can be achieved in parallel by doing it in another thread besides the main thread. Again, if our copies weren't so tiny compared to our model invocation, we would do this. But they are, so we won't. The only copy which really needs this is the prediction copy, because its data only becomes available once the forward pass has completed; if we wait for it, we kill our pipeline. The other copies will also block, but their data is readily-available, and the `non_blocking=True` serves more to prevent a stream sync.
 
-Here:
-
-self.symbols_features_buffer.copy_(symbols_features, non_blocking=True)
-self.symbols_mask_buffer.copy_(symbols_mask, non_blocking=True)
+In short, to achieve true async DMA transfer, the participating system memory needs to be pinned.
 
 
-symbols_features and symbols_mask are regular CPU tensors created in Python-land (likely pageable). So each iteration does a hidden “pageable → pinned staging” copy that the CPU must finish before the GPU DMA can even begin. Net effect: your main thread still stalls between minibatches, and the GPU gets fed in bursts instead of a smooth stream.
+## Code Changes
+To build our pipeline, we allocate a pinned tensor to enable async DMA transfer of the predictions once they have been generated. We assign prev variables to fill our pipeline, use them in the steady state, and then finally drain the pipeline by flushing the last remaining prev variables.
 
-And on the output side, this pattern:
+```python
+        prev_mask = None
+        prev_batch_preds = torch.empty((self.B, 4), pin_memory=True)
+        prev_ready = torch.cuda.Event(enable_timing=False)
+        for uids, symbols_features, symbols_mask in minibatches:
+                
+            self.symbols_features_buffer.copy_(symbols_features, non_blocking=True)
+            self.symbols_mask_buffer.copy_(symbols_mask, non_blocking=True)
 
-pred = torch.empty(self.symbols_pred_buffer.shape)   # CPU, pageable by default
-pred.copy_(self.symbols_pred_buffer, non_blocking=True)
-
-
-also stages on the way back. Pageable destination ⇒ can’t DMA directly ⇒ driver stages ⇒ CPU-visible stall.
-
-Fix: preallocate pinned host buffers and reuse them
-
-Allocate a big pinned slab once, then do all D2H copies into slices of it. Same idea for H2D inputs: build minibatch inputs directly in pinned memory (or copy them into pinned buffers), then H2D becomes truly async.
-
-Sketch:
-
-# one-time, in __init__
-self.pinned_features = torch.empty((self.B, self.config.num_features), pin_memory=True, dtype=torch.float32)
-self.pinned_mask     = torch.empty((self.B,), pin_memory=True, dtype=torch.bool)
-
-# if you have N minibatches, preallocate pinned preds as one big slab
-self.max_minibatches = ...
-self.pinned_preds = torch.empty((self.max_minibatches, self.B, 4), pin_memory=True, dtype=torch.float32)
-self.pinned_masks = torch.empty((self.max_minibatches, self.B), pin_memory=True, dtype=torch.bool)
-
-
-Hot loop:
-
-m = 0
-for uids, symbols_features, symbols_mask in minibatches:
-    # ensure CPU-side tensors live in pinned memory
-    self.pinned_features.copy_(symbols_features)   # CPU->CPU copy, cheap-ish
-    self.pinned_mask.copy_(symbols_mask)
-
-    # true async H2D copies (pinned host -> device)
-    self.symbols_features_buffer.copy_(self.pinned_features, non_blocking=True)
-    self.symbols_mask_buffer.copy_(self.pinned_mask, non_blocking=True)
-
-    self.graph.replay()
-
-    # true async D2H copy into pinned slab
-    self.pinned_preds[m].copy_(self.symbols_pred_buffer, non_blocking=True)
-    self.pinned_masks[m].copy_(self.pinned_mask)   # keep the mask aligned with preds
-    m += 1
-
+            self.graph.replay()
+            
+            unique_ids.extend(uids)
+            if prev_mask is not None:
+                prev_ready.synchronize()
+                preds.extend(prev_batch_preds[prev_mask].float().numpy().tolist())
+            prev_mask = symbols_mask.clone()
+            prev_batch_preds.copy_(self.symbols_pred_buffer, non_blocking=True)
+            prev_ready.record()      
+        if prev_mask is not None:
+            prev_ready.synchronize()
+            preds.extend(prev_batch_preds[prev_mask].float().numpy().tolist())
+```
 
 </details>
 

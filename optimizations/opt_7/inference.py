@@ -21,6 +21,11 @@ from huggingface_hub import hf_hub_download
 from client import BaseInferenceClient, PendingRequest, InferenceResponse
 from model.inference_model import MultiTowerModel, ModelConfig
 
+torch.set_default_dtype(torch.bfloat16)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('medium')
+
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -54,10 +59,8 @@ class NnInferenceClient(BaseInferenceClient):
         nparams = sum(p.numel() for p in self.model.parameters())
         print(f"{nparams = }")
 
-        self.symbol_states = {
-            f"SYM_{num:03d}": self.model.init_state(1, self.device)
-            for num in range(self.num_symbols)
-        }
+        self.B = self.num_symbols 
+        self.symbol_to_index = {f"SYM_{i:03d}": i for i in range(self.num_symbols)}
 
         weights_file = hf_hub_download(
             repo_id="jane-street-gpu-mode/hackathon",
@@ -66,37 +69,63 @@ class NnInferenceClient(BaseInferenceClient):
         )
         weights = torch.load(weights_file, weights_only=True)
         self.model.load_state_dict(weights)
+        self.model.to(dtype=torch.bfloat16)
 
-        self.model = torch.compile(
-            self.model,
-            fullgraph=True,
-            mode="reduce-overhead"
-        )
+        self.symbols_state = self.model.init_state(self.B, self.device)
 
-    def batch_states(self, states):
-        if isinstance(states[0], torch.Tensor):
-            batched = torch.cat(states, dim=0)
-            return batched
-        return [self.batch_states(list(s)) for s in zip(*states)]
+        # input/output buffers
+        self.symbols_mask_buffer = torch.zeros((self.B,), device=self.device, dtype=torch.bool)
+        self.symbols_features_buffer = torch.empty((self.B, self.config.num_features), device=self.device)
+        self.symbols_pred_buffer = torch.empty((self.B, 4), device=self.device)
 
-    def unbatch_states(self, batched_state):
-        if isinstance(batched_state, torch.Tensor):
-            B = batched_state.size(0)
-            return [batched_state[i:i+1].clone() for i in range(B)] # remember individual states had batch dim 1, clone to persist CUDA graph result
-        return list(zip(*[self.unbatch_states(child) for child in batched_state]))
+        self.graph = torch.cuda.CUDAGraph()
+        self._capture_done = False
 
     def interleave_by_symbol(self, requests_by_symbol):
         n = max(len(reqs) for reqs in requests_by_symbol.values())
         for i in range(n):
-            uids, symbols, features = [], [], []
+            symbols_features = torch.empty((self.B, self.config.num_features))
+            symbols_mask = torch.zeros((self.B,), dtype=torch.bool)
+            uids_by_row = [None] * self.B
             for symbol, reqs in requests_by_symbol.items():
                 if i >= len(reqs):
                     continue
                 req = reqs[i]
-                symbols.append(symbol)
-                uids.append(req.unique_id)
-                features.append(req.features)
-            yield uids, symbols, torch.tensor(features)
+                symbol_index = self.symbol_to_index[symbol]
+                uids_by_row[symbol_index] = req.unique_id
+                symbols_mask[symbol_index] = True
+                symbols_features[symbol_index].copy_(torch.tensor(req.features))
+            uids = [uid for uid in uids_by_row if uid is not None]
+            yield uids, symbols_features, symbols_mask
+
+    def update_state(self, new_state, mask, old_state=None):
+        old_state = old_state if old_state is not None else self.symbols_state
+        if isinstance(new_state, torch.Tensor):
+            update = mask.view(self.B, *([1] * (new_state.ndim - 1)))
+            torch.where(update, new_state, old_state, out=old_state)
+            return
+        for new_s, old_s in zip(new_state, old_state):
+            self.update_state(new_s, mask, old_s)
+
+    @torch.inference_mode()
+    @torch.compile(fullgraph=True, dynamic=False)
+    def predict(self):
+        symbols_pred, symbols_state = self.model(self.symbols_features_buffer, self.symbols_state)
+        self.symbols_pred_buffer.copy_(symbols_pred) # pred is small so this is cheap
+        self.update_state(symbols_state, self.symbols_mask_buffer)
+
+    def capture(self):
+        # Warmup (populate allocator / pick kernels)
+        for _ in range(3):
+            self.predict() 
+
+        torch.cuda.synchronize()
+
+        # Capture
+        with torch.cuda.graph(self.graph):
+            self.predict()
+
+        self._capture_done = True
 
     def process_batch(
         self, requests_by_symbol: Dict[str, List[PendingRequest]]
@@ -105,20 +134,32 @@ class NnInferenceClient(BaseInferenceClient):
 
         start = time.time()
 
+        if not self._capture_done:
+            self.capture()
+
         minibatches = self.interleave_by_symbol(requests_by_symbol)
 
-        for uids, symbols, reqs_features in minibatches:
-            reqs_features = reqs_features.to(device=self.device)
-            symbols_state = self.batch_states([self.symbol_states[symbol] for symbol in symbols])
+        prev_mask = None
+        prev_batch_preds = torch.empty((self.B, 4), pin_memory=True)
+        prev_ready = torch.cuda.Event(enable_timing=False)
+        for uids, symbols_features, symbols_mask in minibatches:
+                
+            self.symbols_features_buffer.copy_(symbols_features, non_blocking=True)
+            self.symbols_mask_buffer.copy_(symbols_mask, non_blocking=True)
+
+            self.graph.replay()
             
-            with torch.inference_mode():
-                symbols_pred, symbols_state = self.model(reqs_features, symbols_state)
-
             unique_ids.extend(uids)
-            preds.extend(symbols_pred.cpu().numpy().astype(float).tolist())
+            if prev_mask is not None:
+                prev_ready.synchronize()
+                preds.extend(prev_batch_preds[prev_mask].float().numpy().tolist())
+            prev_mask = symbols_mask.clone()
+            prev_batch_preds.copy_(self.symbols_pred_buffer, non_blocking=True)
+            prev_ready.record()      
+        if prev_mask is not None:
+            prev_ready.synchronize()
+            preds.extend(prev_batch_preds[prev_mask].float().numpy().tolist())
 
-            for symbol, symbol_state in zip(symbols, self.unbatch_states(symbols_state)):
-                self.symbol_states[symbol] = symbol_state
 
         end = time.time()
         elapsed = end - start
