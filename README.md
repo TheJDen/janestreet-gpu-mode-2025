@@ -1,7 +1,7 @@
 # PyTorch GPU Optimizations Walkthrough
 
 
-This repository is a guided walkthrough in making a slow inference client fast. You are meant to move in order, with the goal being to build an intuition for how to identify and resolve bottlenecks by repeatedly profiling and fixing what the evidence points at. This version is focusing on changes that can be made without tinkering with model internals, and considering implementation time as a constraint as opposed to pure performance.
+This repository is a guided walkthrough in making a slow inference client fast. You are meant to move in order, with the goal being to build an intuition for how to identify and resolve bottlenecks by repeatedly profiling and fixing what the evidence points at. This version is focusing on changes that can be made at the CUDA Runtime API level without tinkering with model internals, and considering implementation time as a constraint as opposed to pure performance.
 
 There is a path for people who can run the code on a device with an NVIDIA H100, and a path for people who can only read.
 
@@ -97,30 +97,31 @@ Read each optimization in order, and follow along to the best of your ability (t
 
 ### Read-Only Path
 
-If you can’t run this repo:
+If you can’t run this repo, you should be able to load the profile traces and eval outputs from the hyperlinks. If not, download the files from the [v1 release](https://github.com/TheJDen/janestreet-gpu-mode-2025/releases/tag/v1.0).
+
+I recommend taking an approach where you make predictions and actually write them or type them out before reading. This helps hold you accountable as you solidify your understanding, because you can compare where your output fell short or went wrong.
+
+Here is a potential way of going through this walkthrough:
 - Read each optimization in order
-- Download the evaluator outputs and profiler traces from the latest Github Release
-- Reason about what code changes you would make (I recommend actually typing the changes out in an IDE)
-- Compare your solution to the explanation
+- First inspect the `inference.py` source and write down what you predict the Perfetto trace looks like and what the largest bottleneck or next thing to work on should be
+- View the Perfetto Trace and read the hint if you need a nudge, and change your prediction if necessary
+- Read the explanation and compare it your prediction
+- Try implementing the change implied by the explanation in code (actually type it out in an IDE)
+- Compare your solution to the code changes
 
 ---
 
 # The Walkthrough
 
-## Baseline
-
-This is the starting point. It is correct, but slow.
-
-Profiling shows:
-- Many tiny kernels
-- Heavy Python overhead
-- GPU waiting on CPU
-
-There is no hint or explanation here, this is simply the reference point.
+The first few traces are really big and may be slow to load
 
 ---
 
 ## Optimization 1
+
+- [Baseline Source](https://github.com/TheJDen/janestreet-gpu-mode-2025/blob/main/optimizations/opt_0_baseline/inference.py)
+- [Baseline Trace](https://ui.perfetto.dev/#!/?url=https://thejden.github.io/artifacts/perfetto/opt_0_baseline_trace.json)
+- [Baseline Eval](https://thejden.github.io/artifacts/eval-small/opt_0_baseline_eval.txt)
 
 <details>
 <summary>Hint</summary>
@@ -273,6 +274,10 @@ That’s the GPU doing what it’s good at: lots of work, all at once.
 
 ## Optimization 2
 
+- [Optimization 1 Source](https://github.com/TheJDen/janestreet-gpu-mode-2025/blob/main/optimizations/opt_1/inference.py)
+- [Optimization 1 Trace](https://ui.perfetto.dev/#!/?url=https://thejden.github.io/artifacts/perfetto/opt_1_trace.json)
+- [Optimization 1 Eval](https://thejden.github.io/artifacts/eval-small/opt_1_eval.txt)
+
 <details>
 <summary>Hint</summary>
 
@@ -389,6 +394,10 @@ The solution is to copy our outputs and state because we need to persist them.
 
 ## Optimization 3
 
+- [Optimization 2 Source](https://github.com/TheJDen/janestreet-gpu-mode-2025/blob/main/optimizations/opt_2/inference.py)
+- [Optimization 2 Trace](https://ui.perfetto.dev/#!/?url=https://thejden.github.io/artifacts/perfetto/opt_2_trace.json)
+- [Optimization 2 Eval](https://thejden.github.io/artifacts/eval-small/opt_2_eval.txt)
+
 <details>
 <summary>Hint</summary>
 
@@ -485,6 +494,10 @@ We should see no more recaptures now that the shapes are static from `torch.comp
 
 ## Optimization 4
 
+- [Optimization 3 Source](https://github.com/TheJDen/janestreet-gpu-mode-2025/blob/main/optimizations/opt_3/inference.py)
+- [Optimization 3 Trace](https://ui.perfetto.dev/#!/?url=https://thejden.github.io/artifacts/perfetto/opt_3_trace.json)
+- [Optimization 3 Eval](https://thejden.github.io/artifacts/eval-small/opt_3_eval.txt)
+
 <details>
 <summary>Hint</summary>
 
@@ -566,6 +579,10 @@ Now when we process our first minibatch we capture, and otherwise we replay our 
 
 ## Optimization 5
 
+- [Optimization 4 Source](https://github.com/TheJDen/janestreet-gpu-mode-2025/blob/main/optimizations/opt_4/inference.py)
+- [Optimization 4 Trace](https://ui.perfetto.dev/#!/?url=https://thejden.github.io/artifacts/perfetto/opt_4_trace.json)
+- [Optimization 4 Eval](https://thejden.github.io/artifacts/eval-small/opt_4_eval.txt)
+
 <details>
 <summary>Hint</summary>
 
@@ -595,6 +612,10 @@ Note: `torch.compile` turns the device-to-device copies from `torch.where` into 
 </details>
 
 ## Optimization 6
+
+- [Optimization 5 Source](https://github.com/TheJDen/janestreet-gpu-mode-2025/blob/main/optimizations/opt_5/inference.py)
+- [Optimization 5 Trace](https://ui.perfetto.dev/#!/?url=https://thejden.github.io/artifacts/perfetto/opt_5_trace.json)
+- [Optimization 5 Eval](https://thejden.github.io/artifacts/eval-small/opt_5_eval.txt)
 
 <details>
 <summary>Hint</summary>
@@ -645,6 +666,10 @@ And make sure to cast our preds back to float
 
 
 ## Optimization 7
+
+- [Optimization 6 Source](https://github.com/TheJDen/janestreet-gpu-mode-2025/blob/main/optimizations/opt_6/inference.py)
+- [Optimization 6 Trace](https://ui.perfetto.dev/#!/?url=https://thejden.github.io/artifacts/perfetto/opt_6_trace.json)
+- [Optimization 6 Eval](https://thejden.github.io/artifacts/eval-small/opt_6_eval.txt)
 
 <details>
 <summary>Hint</summary>
@@ -783,6 +808,10 @@ To build our pipeline, we allocate a pinned tensor to enable async DMA transfer 
 ---
 
 ## End
+
+- [Final Optimization Source](https://github.com/TheJDen/janestreet-gpu-mode-2025/blob/main/optimizations/opt_7/inference.py)
+- [Final Optimization Trace](https://ui.perfetto.dev/#!/?url=https://thejden.github.io/artifacts/perfetto/opt_7_trace.json)
+- [Final Optimization Eval](https://thejden.github.io/artifacts/eval-small/opt_7_eval.txt)
 
 If you can look at a PyTorch pipeline and confidently say:
 “I know what to try next — and why”  
