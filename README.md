@@ -20,7 +20,8 @@ There is a path for people who can run the code on a device with an NVIDIA H100,
   - [Optimization 3](#optimization-3)
   - [Optimization 4](#optimization-4)
   - [Optimization 5](#optimization-5)
-
+  - [Optimization 6](#optimization-6)
+  - [Optimization 7](#optimization-7)
 ---
 
 ## What You’re Optimizing
