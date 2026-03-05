@@ -14,7 +14,6 @@ There is a path for people who can run the code on a device with an NVIDIA H100,
   - [Runnable Path](#runnable-path) 
   - [Read-Only Path](#read-only-path)
 - [The Walkthrough](#the-walkthrough)
-  - [Baseline](#baseline) 
   - [Optimization 1](#optimization-1)
   - [Optimization 2](#optimization-2)
   - [Optimization 3](#optimization-3)
@@ -502,7 +501,7 @@ We should see no more recaptures now that the shapes are static from `torch.comp
 <details>
 <summary>Hint</summary>
 
-We are communication-bound now from device-to-device copies, and there are still quite a few kernel launches in our state udpate.
+We are communication-bound now from device-to-device copies, and there are still quite a few kernel launches in our state update.
 
 </details>
 <details>
